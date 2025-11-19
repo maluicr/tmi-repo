@@ -1,3 +1,3 @@
-# tmi-repo
+# Data, code and outputs: infant mortality in Portugal 2015-2024
 
 The aim of this anaysis is to assess the spatial and temporal evolution of infant mortality in Portugal over the last decade. Based on data published by the National Statistics Institute on the annual number of deaths during the first year of life and the annual number of live births, by municipality during the period 2015-2024, the relative risk of infant mortality was analysed. Between 2015 and 2024, there was an (expected) general decline in infant mortality, which reached its lowest level in 2021. However, since then, the general trend has reversed. The analysis suggests that in some municipalities (e.g. Barreiro, Amadora) the relative risks are significantly higher (than 1) and have increased over time. More research is required to understand why infant mortality is increasing since 2021.
