@@ -11,7 +11,7 @@ author:
   affiliation: Direção Geral de Saúde
   url: https://www.dgs.pt/
 abstract: |
-  O objetivo deste estudo é avaliar a evolução espacial e temporal da mortalidade infantil em Portugal ao longo da última década.
+  O objetivo desta análise é avaliar a evolução espacial e temporal da mortalidade infantil em Portugal ao longo da última década.
   A partir de dados publicados pelo Instituto Nacional de Estatística referentes ao número anual de óbitos durante o primeiro ano de vida e número anual de nados-vivos, por concelho durante o periodo 2015-2024 analisou-se o risco relativo de mortalidade infantil.
   Entre 2015-2024 observou-se um (esperado) declínio generalizado na mortalidade infantil, que atingiu o valor mínimo em 2021. No entanto, de então para cá a tendência geral inverteu-se. A análise sugere que em alguns concelhos (e.g. Barreiro, Amadora) os riscos relativos são significativamente mais elevados (que 1), e que têm aumentado ao longo do tempo.
 date: |
@@ -59,36 +59,29 @@ options(digits = 3, width = 120,
 
 ## Dados
 
-Para analisar a evolução espaço-temporal da mortaliade infantil em Portugal desde 1 de janeiro de 2015 a 31 de dezembro de 2024, foram analisados os dados seguintes:
+Para analisar a evolução espaço-temporal da mortaliade infantil em Portugal desde 1 de janeiro de 2015 a 31 de dezembro de 2024, foram usados os dados seguintes:
 
-- Óbitos de menos de 1 ano (N.º) por municipio/concelho, por ano 
-- Nados-vivos (N.º) por município/concelho de residência da mãe
+- Óbitos de menos de 1 ano (N.º) por concelho, por ano;
+- Nados-vivos (N.º) por concelho de residência da mãe
 
 Os dados foram obtidos no Instituto Nacional de Estatística. Para além destes dados foram também usados os dados do European Deprivation Index 2011 - EDI. O EDI é um índice ajustado para Portugal^[https://doi.org/10.1371/journal.pone.0208320] que serve de indicador sobre o grau de privação socio-económica em cada concelho. Valores mais altos deste índice estão associados a concelhos com maior grau de privação socio-económica. Os dados do índice serviram para explorar diferenças nos riscos relativos de mortalidade infantil por concelho e ano, controlando o efeito do grau de privação.
 
 ```{r livrarias}
-# manuel.ribeiro@tecnico.ulisboa.pt
-# created: 2025-05-29
-# last revision : 2025-05-29
-
-# tumores infantis 2015-2024 (dados INE, pedido DGS)
-# https://www.paulamoraga.com/book-geospatial/sec-spatialepiapp.html
-
-library(sf)
-library(dplyr)
-library(reshape2)
-library(ggplot2)
-library(leaflet)
-library(SpatialEpi)
+library(sf) # spatial data
+library(dplyr) # pipelines  
+library(reshape2) # melt long wide tables
+library(ggplot2) # nice plots
+library(leaflet) # presentation with mapview
+library(SpatialEpi) # clustering with satscan
 library(cowplot) # 2+ ggplots 
+library(INLA)
 source("f_tabelas.R")
-
 ```
 
 
 ```{r dados-gis}
 # shapefile pt cc
-pt_gis <- st_read("../gis/cc_caop2013_pop19.shp", quiet = TRUE)[,c("oid_","nome_cc")]
+pt_gis <- st_read("./gis/cc_caop2013_pop19.shp", quiet = TRUE)[,c("oid_","nome_cc")]
 pt_gis <- pt_gis[order(pt_gis$nome_cc), ]
 pk <- pt_gis$nome_cc
 ```
@@ -96,12 +89,12 @@ pk <- pt_gis$nome_cc
 
 ```{r dados-tmi}
 
-casos <- read.table("../dados_base/casos.txt", sep = "\t", header = T, encoding = "latin1")
+casos <- read.table("./data/casos.txt", sep = "\t", header = T, encoding = "latin1")
 # retirar acores e madeira
 casos <- casos %>% filter(Nomes_cc %in% pk)
 names(casos) <- c("cc", 2015:2024)
 
-pop <- read.table("../dados_base/pop.txt", sep = "\t", header = T, encoding = "latin1")
+pop <- read.table("./data/pop.txt", sep = "\t", header = T, encoding = "latin1")
 # retirar acores e madeira
 pop <- pop %>% filter(Nomes_cc %in% pk)
 names(pop) <- c("cc", 2015:2024)
@@ -114,8 +107,7 @@ names(data) <- c("cc", "ano", "y", "pop")
 ```
 
 ```{r dados-edi}
-
-edi <- read.table("../dados_base/edi_2011.csv", sep = ";", dec = ",", header = T, encoding = "latin1")
+edi <- read.table("./data/edi_2011.csv", sep = ";", dec = ",", header = T, encoding = "latin1")
 edi$EDI_QUINTILE <- factor(edi$EDI_QUINTILE)
 data <- dplyr::inner_join(data, edi[,c("GEO_COD_DSG","EDI_SCORE","EDI_QUINTILE")], by = c("cc" = "GEO_COD_DSG"))
 ```
@@ -167,19 +159,17 @@ mapa$ano <- as.integer(mapa$ano)
 
 ### Risco relativo (RR)
 
-Para estimar o risco relativo (RR) de mortalidade infantil por concelho (em relação ao risco da população), usou-se uma abordagem Bayesiana baseada numa regressão ecológica espaço-temporal. Esta abordagem permitiu atenuar o efeito nas estimativas provocado por concelhos com baixo número de nados-vivos e, ao mesmo tempo, identificar padrões espaço-temporais de mortalidade infantil. 
+Para estimar o risco relativo (RR) de mortalidade infantil por concelho (em relação ao da população de referência), usou-se uma abordagem Bayesiana baseada numa regressão ecológica espaço-temporal. Esta abordagem permitiu atenuar o efeito dos pequenos números nas estimativas do RR, provocado por concelhos com baixo número de nados-vivos (e consequentemente óbitos) e, ao mesmo tempo, identificar padrões espaço-temporais do RR de morrer durante o primeiro ano de vida. Em algumas das regressões especificadas adicionou-se a covariável EDI, que permitiu avaliar o impacto dos efeitos aleatórios espaciais e temporais na variação do RR, controlando o efeito do índice EDI. 
 
-A inclusão da covariável EDI por concelho em algumas das regressões permitiu avaliar o impacto dos efeitos aleatórios espaciais, temporais e espaço-temporais, controlando o efeito de EDI na variação do RR.
-
-Com recurso ao package INLA^[https://doi.org/10.1111/j.1467-9868.2008.00700.x] especificou-se um modelo de Poisson dado por:  
+Com recurso ao package INLA^[https://doi.org/10.1111/j.1467-9868.2008.00700.x] especificou-se uma regressão Poisson:  
 
 $$
 Y_{ij}\sim \text{P}\big(E_{ij}\theta_{ij}\big)
 $$
 
-com $Y_{ij}$ o número de óbitos observados, $E_{ij}$ é o número de óbitos esperados e $\theta_{ij}$ é o risco relativo de mortalidade infantil no concelho $i$ no ano $j$. 
+onde $Y_{ij}$ o número de óbitos observados no concelho $i$ no ano $j$, $E$ representa o número de óbitos esperados se a taxa de mortalidade infantil fosse a da população de referência e $\theta$ representa o RR de morrer durante o primeiro ano de vida. 
 
-A partir deste modelo, exploraram-se diferentes especificações para $\theta_{ij}$ (em vez de $\theta_{ij}$ modelou-se $\log(\theta_{ij})$ por causa da sua relação linear com os preditores): 
+Exploraram-se diferentes especificações para modelar $\theta_{ij}$ (em vez de $\theta_{ij}$ modelou-se $\log(\theta_{ij})$ por causa da relação linear com os preditores): 
 
 \begin{align}
 M1: \log(\theta_{ij})&=\alpha+\beta t_j \\
@@ -246,11 +236,11 @@ d$idareatime <- seq(1,length(d$idarea))
 d$idtimearea <- d$idareatime
 ```
 
-O ajustamento destes modelos com nível de complexidade crescente mostrou-se útil para a exploração dos dados. Partindo de um modelo temporal de tendência linear global (M1) adicionaram-se as componentes espacial e temporal com efeitos estruturados e não-estruturados (M2-M3), a interação entre ambos (M4) e ainda o impacto destas componentes controlando o efeito do indice de privação socio-económico (EDI) (M5-M7). 
+O ajustamento destes modelos com nível de complexidade crescente mostrou-se útil para a exploração dos dados. Partindo de um modelo temporal de tendência linear global (M1) adicionaram-se as componentes espacial e temporal com efeitos estruturados e não-estruturados (M2-M3), a interação entre ambos (M4) e ainda o impacto destas componentes controlando o efeito do indice de privação socio-económico (EDI) (M5-M7).
 
 ### Priors
 
-Para a especificação das *priors* tomou-se em consideração a redução acentuada e consistente na mortalidade infantil observada desde a decada de 1970 (dados Pordata^[https://www.pordata.pt/pt/estatisticas/populacao/esperanca-de-vida-e-obitos/taxa-de-mortalidade-infantil-0]), que atingiu uma taxa 2.2 óbitos por cada 1000 nascimentos em 2021. Embora se tenha registado um aumento de lá para cá (2.2 para 3.2 em 2024), a tendência 'consistente' de declínio da mortalidade infantil ao longo das últimas décadas leva a considerar que a variação temporal e espacial do risco relativo tende a ser 'suave', com baixa variabilidade no espaço e tempo.
+Para a especificação das *priors* tomou-se em consideração a redução acentuada e consistente na mortalidade infantil observada desde a decada de 1970 (dados Pordata^[https://www.pordata.pt/pt/estatisticas/populacao/esperanca-de-vida-e-obitos/taxa-de-mortalidade-infantil-0]), que atingiu uma taxa 2.1 óbitos por cada 1000 nados-vivos em 2021. Embora se tenha registado um aumento de lá para cá (2.1 para 3.2 em 2024), a tendência 'consistente' de declínio da mortalidade infantil ao longo das últimas décadas leva a considerar que a variação temporal e espacial do risco relativo tende a ser suave, com baixa variabilidade no espaço e tempo.
 
 ```{r priors-inla}
 
@@ -306,6 +296,7 @@ control.fixed <- list(
 
 ```{r modelos-inla}
 
+# adaptado de 
 # Cap 7, Spatial and Spatio-temporal Bayesian Models with R-INLA
 # Marta Blangiardo, Michella Cameleti
 
@@ -448,7 +439,7 @@ $$
 P(\phi> `r hyper.bym2$phi$param[2]`)=`r hyper.bym2$phi$param[2]`
 $$
 
-Para a estrutura temporal especificou-se um passeio aleatório (*random walk*) de primeira ordem com erros aleatórios gaussianos $\varepsilon \sim \text{N}(0,\sigma^2)$ e uma precisão elevada (i.e. baixo desvio padrão):
+Para a estrutura temporal especificou-se um passeio aleatório (*random walk*) de primeira ordem com erros aleatórios gaussianos $\varepsilon \sim \text{N}(0,\sigma^2)$ e uma precisão elevada (i.e. desvio padrão reduzido):
 
 $$
 P(\sigma>`r hyper.temporal$prec$param[1]`)=`r hyper.temporal$prec$param[2]`
@@ -786,8 +777,8 @@ rr6UL_wide <- d %>%
     values_from = UL6
   )
 
-rr_table <- create_rr_table_tidy_formatted(rr6_wide, rr6LL_wide , rr6UL_wide , digits = 2)
-display_rr_table(rr_table)
+rr_table <- tabrr_val(rr6_wide, rr6LL_wide , rr6UL_wide , digits = 2)
+tabrr(rr_table)
 ```
 
 ```{r fixed-edi}
