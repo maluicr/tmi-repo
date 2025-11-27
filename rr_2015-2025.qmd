@@ -1,0 +1,1416 @@
+---
+title: "Mortalidade infantil em Portugal 2015-2024"
+short-title: "Evolução espaço-temporal"
+author: 
+- name: Manuel Ribeiro
+  affiliation: CERENA, IST-UL
+  orcid: 0000-0002-7890-7708
+  url: https://cerena.ist.utl.pt/user/629
+  email: manuel.ribeiro@tecnico.ulisboa.pt
+- name: Direção de Serviços de Informação e Análise 
+  affiliation: Direção Geral de Saúde
+  url: https://www.dgs.pt/
+abstract: |
+  O objetivo desta análise é avaliar a evolução espacial e temporal da mortalidade infantil em Portugal ao longo da última década.
+  A partir de dados publicados pelo Instituto Nacional de Estatística referentes ao número anual de óbitos durante o primeiro ano de vida e número anual de nados-vivos, por concelho durante o periodo 2015-2024 analisou-se o risco relativo de mortalidade infantil.
+  Entre 2015-2024 observou-se um (esperado) declínio generalizado na mortalidade infantil, que atingiu o valor mínimo em 2021. No entanto, de então para cá a tendência geral inverteu-se. A análise sugere que em alguns concelhos (e.g. Barreiro, Amadora) os riscos relativos são significativamente mais elevados (que 1), e que têm aumentado ao longo do tempo.
+date: |
+  Julho 1, 2025
+code-repo: "Acesso ao código, dados e análise em <https://github.com/maluicr/>"
+keywords:
+  - mortalidade infantil
+  - risco relativo
+  - análise espaço-temporal
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc_float: true
+    number-sections: true
+---
+
+```{=html}
+<style type="text/css">
+   .main-container { max-width: 80%; margin: auto}
+   .row {display: flex;}
+   .column {flex: 50%;}
+</style>
+```
+
+
+```{r setup, include=FALSE}
+if (is.null(knitr::pandoc_to())) {
+  fmt_out <- "interactive"
+} else {
+  fmt_out <- knitr::pandoc_to()
+}
+
+knitr::opts_chunk$set(echo = FALSE, include = TRUE, 
+                      warning = FALSE, message = FALSE)
+
+knitr::opts_chunk$set(fig.align = "center", fig.retina = 3,
+                      fig.width = 6, fig.height = (6 * 0.618),
+                      out.width = "100%", collapse = F)
+
+options(digits = 3, width = 120,
+        dplyr.summarise.inform = FALSE,
+        knitr.kable.NA = "")
+```
+
+## Dados
+
+Para analisar a evolução espaço-temporal da mortaliade infantil em Portugal desde 1 de janeiro de 2015 a 31 de dezembro de 2024, foram usados os dados seguintes:
+
+- Óbitos de menos de 1 ano (N.º) por concelho, por ano;
+- Nados-vivos (N.º) por concelho de residência da mãe
+
+Os dados foram obtidos no Instituto Nacional de Estatística. Para além destes dados foram também usados os dados do European Deprivation Index 2011 - EDI. O EDI é um índice ajustado para Portugal^[https://doi.org/10.1371/journal.pone.0208320] que serve de indicador sobre o grau de privação socio-económica em cada concelho. Valores mais altos deste índice estão associados a concelhos com maior grau de privação socio-económica. Os dados do índice serviram para explorar diferenças nos riscos relativos de mortalidade infantil por concelho e ano, controlando o efeito do grau de privação.
+
+```{r livrarias}
+library(sf) # spatial data
+library(dplyr) # pipelines  
+library(reshape2) # melt long wide tables
+library(ggplot2) # nice plots
+library(leaflet) # presentation with mapview
+library(SpatialEpi) # clustering with satscan
+library(cowplot) # 2+ ggplots 
+library(INLA)
+source("f_tabelas.R")
+```
+
+
+```{r dados-gis}
+# shapefile pt cc
+pt_gis <- st_read("./gis/cc_caop2013_pop19.shp", quiet = TRUE)[,c("oid_","nome_cc")]
+pt_gis <- pt_gis[order(pt_gis$nome_cc), ]
+pk <- pt_gis$nome_cc
+```
+
+
+```{r dados-tmi}
+
+casos <- read.table("./data/casos.txt", sep = "\t", header = T, encoding = "latin1")
+# retirar acores e madeira
+casos <- casos %>% filter(Nomes_cc %in% pk)
+names(casos) <- c("cc", 2015:2024)
+
+pop <- read.table("./data/pop.txt", sep = "\t", header = T, encoding = "latin1")
+# retirar acores e madeira
+pop <- pop %>% filter(Nomes_cc %in% pk)
+names(pop) <- c("cc", 2015:2024)
+
+casos_melt <- casos %>% melt(., id.vars = "cc")
+pop_melt <- pop %>% melt(., id.vars = "cc")
+
+data <- as.data.frame(cbind(casos_melt, pop = pop_melt$value))
+names(data) <- c("cc", "ano", "y", "pop")
+```
+
+```{r dados-edi}
+edi <- read.table("./data/edi_2011.csv", sep = ";", dec = ",", header = T, encoding = "latin1")
+edi$EDI_QUINTILE <- factor(edi$EDI_QUINTILE)
+data <- dplyr::inner_join(data, edi[,c("GEO_COD_DSG","EDI_SCORE","EDI_QUINTILE")], by = c("cc" = "GEO_COD_DSG"))
+```
+
+O mapa de Portugal usado para realizar a análise espacial por concelho é fornecido em formato digital (*shapefile*) pela Direção Geral de Saúde^[https://www.dgterritorio.gov.pt/cartografia/cartografia-tematica/caop]. 
+
+```{r dados-sir}
+
+# SMR = O/E
+E <- expected(
+  population = data$pop,
+  cases = data$y,
+  n.strata = 1
+)
+
+data$E <- E
+data$sir <- data$y/data$E
+data$tmi <- round(1000 * data$y / data$pop,2)
+d <- data[order(data$ano, data$cc), ]
+d$ano <- as.numeric(as.character(d$ano))
+
+# mapa reshape para plot shape
+dw <- reshape(d,
+              timevar = "ano",
+              idvar = "cc",
+              direction = "wide"
+)
+
+# mapa
+mapa <- dplyr::left_join(pt_gis, dw, by = c("nome_cc" = "cc"))
+mapa <- mapa %>%
+  pivot_longer(
+    cols = c(paste0("sir.", 2015:2024), 
+             paste0("tmi.", 2015:2024), 
+             paste0("EDI_SCORE.", 2015:2024),
+             paste0("EDI_QUINTILE.", 2015:2024),
+             paste0("y.", 2015:2024),
+             paste0("pop.", 2015:2024),
+             paste0("E.", 2015:2024)
+             ),
+    names_to = c(".value", "ano"),
+    names_pattern = "(sir|tmi|EDI_SCORE|EDI_QUINTILE|y|pop|E)\\.(.*)"
+  )
+mapa$ano <- as.integer(mapa$ano)
+```
+
+
+## Métodos
+
+### Risco relativo (RR)
+
+Para estimar o risco relativo (RR) de mortalidade infantil por concelho (em relação ao da população de referência), usou-se uma abordagem Bayesiana baseada numa regressão ecológica espaço-temporal. Esta abordagem permitiu atenuar o efeito dos pequenos números nas estimativas do RR, provocado por concelhos com baixo número de nados-vivos (e consequentemente óbitos) e, ao mesmo tempo, identificar padrões espaço-temporais do RR de morrer durante o primeiro ano de vida. Em algumas das regressões especificadas adicionou-se a covariável EDI, que permitiu avaliar o impacto dos efeitos aleatórios espaciais e temporais na variação do RR, controlando o efeito do índice EDI. 
+
+Com recurso ao package INLA^[https://doi.org/10.1111/j.1467-9868.2008.00700.x] especificou-se uma regressão Poisson:  
+
+$$
+Y_{ij}\sim \text{P}\big(E_{ij}\theta_{ij}\big)
+$$
+
+onde $Y_{ij}$ o número de óbitos observados no concelho $i$ no ano $j$, $E$ representa o número de óbitos esperados se a taxa de mortalidade infantil fosse a da população de referência e $\theta$ representa o RR de morrer durante o primeiro ano de vida. 
+
+Exploraram-se diferentes especificações para modelar $\theta_{ij}$ (em vez de $\theta_{ij}$ modelou-se $\log(\theta_{ij})$ por causa da relação linear com os preditores): 
+
+\begin{align}
+M1: \log(\theta_{ij})&=\alpha+\beta t_j \\
+M2: \log(\theta_{ij})&=\alpha+u_i+v_i+(\beta+\delta_i)* t_j \\
+M3: \log(\theta_{ij})&=\alpha+u_i+v_i+\gamma_j + \phi_j \\
+M4: \log(\theta_{ij})&=\alpha+u_i+v_i+\gamma_j + \phi_j + \delta_{ij}\\
+M5: \log(\theta_{ij})&=\alpha+u_i+v_i+(\beta+\delta_i)* t_j + \beta_{\scriptsize\text{EDI}} \times \scriptsize\text{EDI}_i \\
+M6: \log(\theta_{ij})&=\alpha+u_i+v_i+\gamma_j + \phi_j + \beta_{\scriptsize\text{EDI}} \times \scriptsize\text{EDI}_i \\
+M7: \log(\theta_{ij})&=\alpha+u_i+v_i+\gamma_j + \phi_j + \delta_{ij} + \beta_{\scriptsize\text{EDI}} \times \scriptsize\text{EDI}_i 
+\end{align}
+
+Onde: 
+
+- $\alpha$ representa a ordenada na origem; 
+- $u_i$ representa a componente espacial estruturada;
+- $v_i$ representa a componente espacial não-estruturada, i.i.d com distribuição $\text{N}\sim (0,\sigma_v^2)$; 
+- $\beta$ representa a tendência linear temporal (impacto global, i.e., independente do concelho)
+- $\delta_i$ representa o impacto linear do tempo em cada concelho (impacto local); 
+- $\gamma_j$ representa a componente temporal estruturada no tempo (i.e. autocorrelacionada);
+- $\phi_j$ representa a componente temporal não-estruturada, com distribuição $\text{N}\sim (0,\sigma_\phi^2)$;
+- $\delta_{ij}$ representa um termo de interação dos efeitos espaciais e temporais não-estruturados;
+- $\beta_{\scriptsize\text{EDI}}$ representa o efeito associado à covariavel indice EDI.
+
+```{r madj-inla}
+
+library(INLA)
+library(spdep)
+
+
+# cria lista poligonos vizinhos
+# portugal (apenas 278 obs)
+# apenas para vizualizar matriz de vizinhos
+# NAO USADA NOS CALCS!!
+# nb_pt <- poly2nb(pt_gis)
+# nb2INLA("map_pt.adj", nb_pt)
+# g_pt <- inla.read.graph(filename = "map_pt.adj")
+# image(inla.graph2matrix(g_pt),xlab="",ylab="")
+
+# cria lista poligonos vizinhos
+# portugal (2780 obs, 278 cc * 10 anos)
+# nb <- poly2nb(mapa)
+# saveRDS(nb,"matviz.rds")
+nb <- readRDS("matviz.rds")
+# head(nb)
+
+# converte lista para INLA
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+# image(inla.graph2matrix(g),xlab="",ylab="")
+
+# efeito aleatorio espacial
+# indices das areas, anos e interacoes
+
+d$idtime <- 1 + d$ano - min(d$ano)
+d$idtime1 <- d$idtime
+d$idtimeint <- d$idtime
+
+d$idarea <- as.numeric(as.factor(d$cc))
+d$idarea1 <- d$idarea
+d$idareaint <- d$idarea
+
+d$idareatime <- seq(1,length(d$idarea))
+d$idtimearea <- d$idareatime
+```
+
+O ajustamento destes modelos com nível de complexidade crescente mostrou-se útil para a exploração dos dados. Partindo de um modelo temporal de tendência linear global (M1) adicionaram-se as componentes espacial e temporal com efeitos estruturados e não-estruturados (M2-M3), a interação entre ambos (M4) e ainda o impacto destas componentes controlando o efeito do indice de privação socio-económico (EDI) (M5-M7).
+
+### Priors
+
+Para a especificação das *priors* tomou-se em consideração a redução acentuada e consistente na mortalidade infantil observada desde a decada de 1970 (dados Pordata^[https://www.pordata.pt/pt/estatisticas/populacao/esperanca-de-vida-e-obitos/taxa-de-mortalidade-infantil-0]), que atingiu uma taxa 2.1 óbitos por cada 1000 nados-vivos em 2021. Embora se tenha registado um aumento de lá para cá (2.1 para 3.2 em 2024), a tendência 'consistente' de declínio da mortalidade infantil ao longo das últimas décadas leva a considerar que a variação temporal e espacial do risco relativo tende a ser suave, com baixa variabilidade no espaço e tempo.
+
+```{r priors-inla}
+
+# efeito aleatorio espacial juntos ui+vi
+hyper.bym2 <- list(
+  prec = list(prior = "pc.prec", param = c(0.5, 0.01)),   # precisão conservadora
+                                                          # p(sd>0.5)=0.01
+  phi = list(prior = "pc", param = c(0.5, 0.6))           # estrutura espacial "moderada"
+                                                          # p(autoc/random>0.5)=0.1 (autocorr/rand ~ [0,1])
+)
+
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# alternativa com efeito aleatorio espacial
+# estruturado (ui) e não estruturado (vi) separados
+# hiperpriors apenas para a precisão 
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+hyper.besag <- list(  # Structured spatial (bi)
+  prec = list(
+    prior = "pc.prec",
+    param = c(1, 0.01)
+  )
+)
+
+hyper.iid <- list(  # Unstructured spatial (hi)
+  prec = list(
+    prior = "pc.prec",
+    param = c(1, 0.01)
+  )
+)
+
+# estrutura temporal (de declínio suave)
+hyper.temporal <- list(
+  prec = list(prior = "pc.prec", param = c(0.1, 0.01))  # variacao temporal suave, baixo sd ao longo do tempo,
+                                                        # p(sd>0.3)=0.01
+)
+
+# interação espaço-temporal (baixa expressao, "outliers alisados" )
+hyper.st <- list(
+  prec = list(prior = "pc.prec",  param = c(1, 0.01))    # termo de interacao reduzido p(sd>1)=0.01
+                                                        # interação sem expressao.
+)
+
+# covariaveis (edi informativa)
+control.fixed <- list(
+  mean.intercept = 0,       # pouco informativa para a ordenada na origem
+  prec.intercept = 0.01,   
+  mean = 0.1,               # trend edi  
+  prec = .5                  # quanto maior o valor edi -> mais privação -> mais mortalidade ~ exp(.1) = 10,5%)
+)
+```
+
+
+```{r modelos-inla}
+
+# adaptado de 
+# Cap 7, Spatial and Spatio-temporal Bayesian Models with R-INLA
+# Marta Blangiardo, Michella Cameleti
+
+# m1 - componente temporal (c ef fixo, linear)
+m1 <- y ~ 1 + idtime
+m1_res <- inla(m1, family = "poisson",
+               data = d, E = E,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+m2 <- y ~ 1 + idtime + 
+  f(idarea, model = "bym2", graph = g, hyper = hyper.bym2) +  # Structured spatial (bi)
+  f(idarea1, idtime, model = "iid", hyper = hyper.st) # interacao iid
+m2_res <- inla(m2,
+               family = "poisson",
+               data = d,
+               E = E,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+# m3
+m3 <- y ~ 1 + f(idarea,model="bym2",graph=g, hyper = hyper.bym2) +
+  f(idtime, model= "rw1", hyper = hyper.temporal) + 
+  f(idtime1, model = "iid" )
+lcs <- inla.make.lincombs(idtime = diag(10), idtime1 = diag(10))
+m3_res <- inla(m3,
+               family="poisson",
+               data=d,
+               E=E,
+               control.predictor=list(compute=TRUE),
+               lincomb=lcs,
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+m4 <- y ~ 1 + f(idarea, model = "bym2", hyper = hyper.bym2 , graph=g) +
+  f(idtime, model = "rw1", hyper = hyper.temporal) +
+  f(idtime1, model = "iid") +
+  f(idareatime, model = "iid", hyper = hyper.st)
+m4_res <- inla(m4,
+               family = "poisson",
+               data = d,
+               E = E,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+
+m5 <- y ~ 1 + idtime + EDI_SCORE +
+  f(idarea, model = "bym2", graph = g, hyper = hyper.bym2) +  # Structured spatial (bi)
+  f(idarea1, idtime, model = "iid", hyper = hyper.st) # interacao iid
+m5_res <- inla(m5,
+               family = "poisson",
+               data = d,
+               E = E,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+# m3
+m6 <- y ~ 1 + EDI_SCORE + 
+  f(idarea,model="bym2",graph=g, hyper = hyper.bym2) +
+  f(idtime, model= "rw1", hyper = hyper.temporal) + 
+  f(idtime1, model = "iid" )
+lcs <- inla.make.lincombs(idtime = diag(10), idtime1 = diag(10))
+m6_res <- inla(m6,
+               family="poisson",
+               data=d,
+               E=E,
+               control.predictor=list(compute=TRUE),
+               lincomb=lcs,
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+m7 <- y ~ 1 + EDI_SCORE +
+  f(idarea, model = "bym2", hyper = hyper.bym2 , graph=g) +
+  f(idtime, model = "rw1", hyper = hyper.temporal) +
+  f(idtime1, model = "iid") +
+  f(idareatime, model = "iid", hyper = hyper.st)
+m7_res <- inla(m7,
+               family = "poisson",
+               data = d,
+               E = E,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+mall_name <- c(paste0("M", 1:7))
+
+# dic
+dicval <- rbind(m1_res$dic$dic,
+m2_res$dic$dic,
+m3_res$dic$dic,
+m4_res$dic$dic,
+m5_res$dic$dic,
+m6_res$dic$dic,
+m7_res$dic$dic)
+
+# waic
+waicval <- rbind(m1_res$waic$waic,
+m2_res$waic$waic,
+m3_res$waic$waic,
+m4_res$waic$waic,
+m5_res$waic$waic,
+m6_res$waic$waic,
+m7_res$waic$waic)
+
+mall_res <- data.frame(Modelo = mall_name, DIC = dicval, WAIC = waicval)
+
+```
+
+
+#### Efeitos fixos
+
+Para a tendência global especificou-se uma distribuição gaussiana não-informativa de média nula e precisão $\tau= 1/\sigma^2=$ `control.fixed$prec.intercept`.
+$$
+\alpha \sim N(`r control.fixed$mean.intercept`, `r 1/control.fixed$prec.intercept`)
+$$
+
+Para o parãmetro associado ao índice EDI especificou-se uma prior informativa com distribuição gaussiana:  
+$$
+\beta_{EDI} \sim N(`r control.fixed$mean`, `r 1/control.fixed$prec`)
+$$
+assumindo à priori a expectativa de uma associação positiva entre a privação socio-económica e a mortalidade infantil.
+
+#### Efeitos aleatórios
+
+As distribuições a priori para os hiperparâmetros dos efeitos aleatórios foram especificadas usando priors de complexidade penalizada (PC priors). 
+
+Para a componente espacial ($u_i+v_i$) adoptou-se o modelo BYM2 (Besag-York-Mollié) especificado com uma combinação de *priors* com componente estruturada, $u_i$, e componente não-estruturada,  $v_i$, onde $u_i$ segue um modelo condicional autoregressivo intrinseco (iCAR) e $v_i$ segue uma distribuição gaussiana de média nula e variancia unitária. 
+
+Para a precisão marginal desta compontente especificou-se uma distribuição $\tau_\varepsilon \sim \text{Gamma}(a,b)$ com parâmetros $a,b$ que favorecem uma baixa variabilidade espacial no contecto da mortalidade infantil.
+
+Para o parâmetro associado à autocorrelação espacial especificou-se uma distribuição $\text{Beta} \sim (\alpha,\beta)$ com parâmetros $\alpha,\beta$ assumindo que à priori, a componente não-estruturada da variabilidade espacial é dominante (sobre a estruturada). Os hiperparâmetros associados são determinados pela condição:
+
+$$
+P(\phi> `r hyper.bym2$phi$param[2]`)=`r hyper.bym2$phi$param[2]`
+$$
+
+Para a estrutura temporal especificou-se um passeio aleatório (*random walk*, RW1) de primeira ordem com erros aleatórios gaussianos $\varepsilon \sim \text{N}(0,\sigma^2)$ e uma precisão elevada (i.e. desvio padrão reduzido):
+
+$$
+P(\sigma>`r hyper.temporal$prec$param[1]`)=`r hyper.temporal$prec$param[2]`
+$$
+
+Para a precisão desta componente especificou-se a distribuição $\tau_\varepsilon \sim \text{Gamma}(a,b)$ com parâmetros $a,b$ que favorecem uma evolução temporal suave, i.e., com probabilidade de 1% de exceder 0.1 (i.e. variação anual do risco relativo entre $-10\%$ e $11\%$:
+
+## Resultados
+
+### Análise descritiva
+
+A taxa de mortalidade infantil anual observada foi a seguintes:
+
+```{r tmistats}
+
+smrstats <- data %>%
+  group_by(ano) %>%
+  summarise(
+    TMI = mean(tmi, na.rm = TRUE),
+    # mediana = median(sir, na.rm = TRUE),
+    # min = min(sir, na.rm = TRUE),
+    # max = max(sir, na.rm = TRUE),
+    # stdev = sd(sir, na.rm = TRUE),
+    # cv = round(sd(sir, na.rm = TRUE)/mean(sir, na.rm = TRUE),1),
+    .groups = 'drop'
+  ) %>%
+  st_drop_geometry()
+
+names(smrstats) <- c("Ano","TMI")
+smrstats$Ano <- factor(smrstats$Ano)
+
+
+  as.data.frame(smrstats) %>%
+    t() %>%
+    kable(format = "html", escape = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                  full_width = F,
+                  font_size = 12)
+```
+
+Em termos globais, ao longo do tempo observam-se valores médios foram desccrescendo de modo suave, com pequenas flutuações. Desde 2021 as taxas anuais de mortalidade infantil têm aumentado. 
+
+Por concelho e por ano, as taxas observadas foram as seguintes:
+
+```{r}
+
+df_tmi <- data %>%
+  dplyr::select(cc, ano, tmi) %>%
+  pivot_wider(names_from = ano, values_from = tmi)
+
+# Styled table with formatted rates
+df_tmi %>%
+  kable(format = "html", escape = FALSE,
+        col.names = c("Concelho", 2015:2024)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE,
+                font_size = 12) %>%
+  scroll_box(width = "100%", height = "400px")
+```
+
+Verifica-se que as taxas mais elevadas ocorreram em concelhos com poucos nascimentos (nados-vivos) por ano (e.g Mora, Fornos de Algodres). 
+
+```{r smr-time-plot, out.width="50%"}
+# time series
+gt <- ggplot(d, aes(x = ano, y = tmi, group = cc, color = cc)) +
+  geom_line() +
+  geom_point(size = 2) +
+  theme(legend.position = "none")
+
+# higlight
+library(gghighlight)
+gh <- gt + gghighlight(cc %in% c("Lisboa","Mora", "Fornos de Algodres", "Porto"))
+gh
+# ggsave("ts-cc.png")
+```
+
+
+Em concelhos com mais população (e.g. Lisboa, Porto), a evolução das TMI não sugere tendência de aumento evidente.
+
+Na tabela seguinte apresentam-se as TMI de acordo com o indice de privação (EDI).Quanto maior for o valor do indíce, maior o índice de privação. Para facilitar a leitura, agruparam-se previamente os concelhos de acordo com o valor EDI, da seguinte forma:
+
+- Grupo 1, concelhos com valor EDI no 1º quintil (0-20), 
+- Grupo 2, concelhos com valor EDI no 2º quintil (20-40), 
+- Grupo 3, concelhos com valor EDI no 3º quintil (40-60),
+- Grupo 4, concelhos com valor EDI no 4º quintil (60-80),
+- Grupo 5, concelhos com valor EDI no 5º quintil (80-100). 
+
+Na tabela seguinte mostram-se as TMI médias obtidas em cada grupo e ano.
+
+```{r, fig.align='center'}
+
+data %>%
+  group_by(EDI_QUINTILE, ano) %>%
+  summarise(TMI = mean(tmi, na.rm = TRUE), .groups = 'drop') %>%
+  pivot_wider(names_from = ano, values_from = TMI) %>%
+  kable(format = "html", escape = FALSE,
+        col.names = c("EDI (Quintil)", 2015:2024)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE,
+                font_size = 12)
+```
+
+### Análise do risco relativo
+
+Para os modelos ajustados (M1-M7) apresentam-se na tabela seguinte os resultados obtidos com as medidas de ajustamento Deviance Information Criterion (DIC) e Watanabe-Akaike Information Criterion (WAIC), de modo a comparar o seu desempenho:
+
+```{r tab-modelos}
+
+mall_res %>%
+  kable(format = "html", escape = FALSE,
+        col.names = c("Modelo", "DIC", "WAIC")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE,
+                font_size = 12)
+```
+
+
+Nesta tabela observa-se que os modelos M2-M7 apresentam melhor ajustamento que M1, o único que não inclui efeitos aleatórios espaciais. Observa-se ainda que a integração da covariável EDI melhora a qualidade do ajustamento quando se considera a componente temporal (estruturada e não-estruturada) conforme especificado em M6 e M7. A análise realizada sugere ainda que a inclusão de um termo de interação com o espaço (M7) não traz melhorias relevantes.
+
+```{r tab-m1}
+m1_sum <- round(m1_res$summary.fixed[,1:5],3)
+rownames(m1_sum) <- c("\u03b1", "\u03b2")
+m1_beta <- exp(round(m1_res$summary.fixed[2,1],2))
+```
+
+Embora o resultado dos últimos anos (2021-2024) aponte para um aumento da taxa de mortalidade infantil, O resultado do modelo M1 sugere uma tendência global de redução significativa do risco relativo ao longo periodo analisado de `r round(100*(1- m1_beta))`\% ($\exp(\beta) \approx `r m1_beta`$). Na tabela seguinte apresentam-se algumas estatisticas sobre a distribuição à posteriori dos parâmetros em M1:
+
+```{r m1-tabela}
+m1_sum %>%
+  kable(format = "html", escape = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE,
+                font_size = 12)
+```
+
+No gráfico seguinte ilustra-se o impacto da tendência temporal linear global no RR, representada pela média da distribuição à posteriori de $\beta$ e respetivos limites inferior e superior para um IC95%.
+
+```{r m1-betaplot, out.width="50%"}
+
+m1_betaplot <- m1_res$summary.fixed[2,1:5]
+beta_mean <- m1_betaplot["idtime", "mean"]
+beta_lower <- m1_betaplot["idtime", "0.025quant"]
+beta_upper <- m1_betaplot["idtime", "0.975quant"]
+
+t <- seq(1, 10, length.out = 10)
+fit <- beta_mean * t
+lfit <- beta_lower * t
+ufit <-beta_upper * t
+# plot(t,fit, type = "l", lty =1 )
+# lines(lfit, lty = 2)
+# lines(ufit, lty = 2)
+
+# Create data frame for ggplot
+plot_data <- data.frame(
+  tempo = t,
+  beta = fit,
+  beta_low = lfit,
+  beta_upp = ufit
+)
+
+# Create ggplot
+ggplot(plot_data, aes(x = tempo)) +
+  # Mean line (solid)
+  geom_line(aes(y = beta), linetype = 1, size = .5, color = "black") +
+  geom_line(aes(y = beta_low), linetype = 2, size = 0.5, color = "black") +
+  geom_line(aes(y = beta_upp), linetype = 2, size = 0.5, color = "black") +
+  scale_x_continuous(breaks = seq(2,10,2)) +
+  # Customize plot
+  labs(
+    x = "t",
+    y = "Beta * t"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+No modelo M2 explora-se o efeito aleatório das componentes espaço - $u_i+v_i$ - e dos efeitos global - $\beta$ - e local - $\delta_i$ - da componente tempo.
+
+```{r m2-mapvars}
+# str(m2_res$marginals.random, max.level = 1)
+m2_mar_zeta <- m2_res$marginals.random[[1]][1:278]
+m2_mar_delta <- m2_res$marginals.random[[2]][1:278]
+zeta <- unlist(lapply(m2_mar_zeta,function(x)inla.emarginal(exp,x)), use.names = F)
+delta <- unlist(lapply(m2_mar_delta,function(x)inla.emarginal(exp,x)), use.names = F)
+```
+
+Os mapas seguintes ilustram as médias da distribuição à posteriori de $\zeta_i = \exp(u_i+v_i)$ (esq.) e de $\exp(\delta_i)$ (dir.).
+
+```{r m2-mapas-pt, fig.cap="Médias da distribuição à posteriori para o efeito aleatório da componentes espacial (esq.) e para efeito do tempo em cada local (dir.)", fig.align='center', out.width="50%"}
+d_gis <- pt_gis
+
+d_gis$zeta <- zeta
+d_gis$delta <- delta
+
+zplot <- ggplot(d_gis) + 
+  # geom_sf(aes(fill = zeta)) +
+  geom_sf(aes(fill = cut(zeta, breaks = 5))) +
+  ggtitle("Componente espacial") + theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  # scale_fill_gradient2(
+  #   midpoint = 1, low = "blue", mid = "white", high = "red")
+  scale_fill_brewer(type = "seq", palette = "Greys") +
+  labs(fill = "\u03B6")
+
+dplot <- ggplot(d_gis) + 
+  # geom_sf(aes(fill = delta)) +
+  geom_sf(aes(fill = cut(delta, breaks = 5))) +
+  ggtitle("Componente Temporal") + theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  scale_fill_brewer(type = "seq", palette = "Greys") +
+  labs(fill = "exp(\u03B4\u1D62)")
+
+plot_grid(zplot, dplot, ncol = 2)
+ggsave("m2-mapas-pt-1.png")
+```
+
+No mapa de $\zeta$ (componente espacial) identifica-se uma tendência para os efeitos serem mais elevados na região de Lisboa e região Sul. Na distribuição de $\exp(\delta_i)$ identifica-se um aumento dos RR entre anos consecutivos mais acentuado em alguns concelhos destas regiões. Os mapas seguintes apresentam com mais detalhe os mapas de $\zeta$ e $\exp(\delta_i)$ para a região de Lisboa. 
+
+
+```{r m2-mapas-zoom, fig.cap="Zoom do mapa da esq. para a região de Lisboa e do mapa da dir. para o Alentejo", fig.align='center'}
+
+# delta top 10
+delta_top10 <- d_gis %>% arrange(desc(delta))
+
+zplot_zoom <- ggplot(d_gis) + 
+  geom_sf(aes(fill = cut(zeta, breaks = 5))) +
+  #ggtitle("\u03B6 (Zoom)") + 
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+    
+  ) +
+  scale_fill_brewer(type = "seq", palette = "Greys") +
+  labs(fill = "\u03B6") +
+  # coord_sf(xlim = c(-119000, 20000), ylim = c(-280000, -50000))
+  # para reuniao 19-11-2025, zoom lx
+  coord_sf(xlim = c(-119000, -60000), ylim = c(-135000, -85000))
+
+dplot_zoom <- ggplot(d_gis) + 
+  geom_sf(aes(fill = cut(delta, breaks = 5))) +
+  #ggtitle("exp(\u03B4\u1D62) (Zoom)") + 
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  scale_fill_brewer(type = "seq", palette = "Greys") +
+  labs(fill = "exp(\u03B4\u1D62)") +
+  # coord_sf(xlim = c(-119000, 20000), ylim = c(-280000, -50000))
+  
+  # para reuniao 19-11-2025, zoom lx
+  coord_sf(xlim = c(-119000, -60000), ylim = c(-135000, -85000))
+
+plot_grid(zplot_zoom, dplot_zoom, ncol = 2)
+ggsave("m2-mapas-zoom-1.png")
+```
+
+Por exemplo, a distribuição de $\exp(\delta_i)$ na região de Lisboa evidência tendências temporais de aumento dos RR mais acentuadas nos concelhos de Almada, Seixal, Barreiro e  Amadora (todos a preto).
+
+Dado que os modelos M2-M7 apresentaram resultados de ajustamento similares, nas secções seguintes vamos ver os resultados obtidos apenas para o que devolveu os melhores resultados: M6.
+
+### Mapas do risco relativo (M6)
+
+O padrão espaço-temporal das médias das distribuições à posteriori dos RR apresenta-se na figura seguinte: 
+
+```{r mapas-rr, fig.cap="Distribuição à posteriori da média do RR por concelho 2015-2024, com M6"}
+
+# m5 (melhor modelo)
+d$RR6 <- m6_res$summary.fitted.values[, "mean"]
+d$LL6 <- m6_res$summary.fitted.values[, "0.025quant"]
+d$UL6 <- m6_res$summary.fitted.values[, "0.975quant"]
+
+# plot
+mapa_in <- merge(
+  mapa, d,
+  by.x = c("nome_cc", "ano"),
+  by.y = c("cc", "ano")
+)
+
+ggplot(mapa_in) + geom_sf(aes(fill = RR6)) +
+  facet_wrap(~ano, dir = "h", ncol = 5) +
+  ggtitle("RR (M6)") + theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red"
+  )
+ggsave("rr6.png")
+
+```
+
+Em termo globais, os resultados obtidos até 2021 estão alinhados com os publicados para o periodo 2016-2021 por Nogueira et al^[https://doi.org/10.20344/amp.19642], que evidência o progresso notável na redução da TMI atingindo os valores mais baixos de sempre durante a pandemia da COVID-19. No entanto, a partir de 2021 observa-se um aumento generalizado do RR, ainda que com valores inferiores aos registados em 2015-2019.
+
+A tabela seguinte contém as estimativas dos RR com IC95% por concelho/ano. Os concelhos/anos com RR significativamente superiores (a 1) estão pintados a rosa.
+
+```{r}
+
+rr6_wide <- d %>%
+  dplyr::select(cc, ano, RR6) %>%
+  pivot_wider(
+    names_from = ano,
+    values_from = RR6
+  )
+
+# LL1
+rr6LL_wide <- d %>%
+  dplyr::select(cc, ano, LL6) %>%
+  pivot_wider(
+    names_from = ano,
+    values_from = LL6
+  )
+
+# UL6
+rr6UL_wide <- d %>%
+  dplyr::select(cc, ano, UL6) %>%
+  pivot_wider(
+    names_from = ano,
+    values_from = UL6
+  )
+
+rr_table <- tabrr_val(rr6_wide, rr6LL_wide , rr6UL_wide , digits = 2)
+tabrr(rr_table)
+```
+
+```{r fixed-edi}
+marginal <- inla.smarginal(m6_res$marginals.fixed$EDI_SCORE)
+marginal <- data.frame(marginal)
+
+ediplot <- ggplot(marginal, aes(x = x, y = y)) + geom_line() +
+  labs(x = expression(beta[1]), y = "Density") +
+   geom_vline(xintercept = 0, col = "black", lty = 2) + 
+  ylab("EDI")
+
+
+# Convert marginal to data frame
+marginal <- m6_res$marginals.fixed$EDI_SCORE
+df <- data.frame(x = marginal[,1], y = marginal[,2])
+
+# Get summary statistics
+summary_stats <- m6_res$summary.fixed["EDI_SCORE", ]
+
+```
+
+Em relação à covariável EDI considerada em M6, os resultados da análise indicam que o aumento do indice de privação sugere um aumento significativo no RR de mortalidade infantil `r round((exp(m6_res$summary.fixed["EDI_SCORE","mean"])-1) * 100,2)`% (IC 95%:`r round((exp(m6_res$summary.fixed["EDI_SCORE",c("0.025quant", "0.975quant")])-1) *100,1)`%).
+
+```{r fixed-ediplot}
+
+ggplot(df, aes(x = x, y = y)) +
+  geom_line(size = 1.2, color = "black") +
+  # geom_area(alpha = 0.3, fill = "lightblue") +
+  geom_vline(xintercept = summary_stats$mean, 
+             color = "black", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = summary_stats$`0.025quant`, 
+             color = "darkgray", linetype = "dotted") +
+  geom_vline(xintercept = summary_stats$`0.975quant`, 
+             color = "darkgray", linetype = "dotted") +
+  labs(title = "Distribuição à posteriori",
+       x = expression(beta[EDI]), 
+       y = "Densidade") +
+  theme_minimal()
+#  
+# marginal <- m6_res$marginals.fixed$EDI_SCORE
+# inla.pmarginal(c(-Inf, Inf), marginal) 
+
+```
+
+### RR 2024 
+
+Nesta secção apresentam-se os resultados para 2024 com mais detalhe. Em particular apresenta-se um gráfico de barras com as estimativas do RR em cada concelho e o respectivo IC95%. As barras dos concelhos com RR significativamente superiores (a 1) estão pintadas a vermelho. 
+
+Nesta secção ilustram-se também os padrões espaciais com os mapas de RR e IC95% para 1) Portugal, 2) região de Lisboa e 3) região Sul.
+
+O gráfico de barras evidência os RR com estimativas significativemnte superiores a 1: Amadora, Barreiro e Odemira.
+
+```{r barplot, eval=T}
+
+# Load required libraries
+library(ggrepel)
+
+d_sort <- d %>%
+  group_by(ano) %>%
+  arrange(ano, RR6) %>%
+  mutate(cc_rank = row_number()) %>%
+  ungroup()
+
+# # plot todos os anos (le-se mal)
+# p <- ggplot(d_sort, aes(x = cc_rank, y = RR6)) +
+#   geom_errorbar(aes(ymin = LL6, ymax = UL6,
+#                     color = ifelse(LL1 >= 1, "Significant", "Not Significant")), 
+#                 width = 0.4, 
+#                 alpha = 0.7) +
+#   geom_point(aes(color = ifelse(LL1 >= 1, "Significant", "Not Significant")), size = 1.5) +
+#   geom_text_repel(data = subset(d_sort, LL1 >= 1),
+#                     aes(label = cc), 
+#                     size = 2.5,
+#                     color = "black",
+#                     box.padding = 0.3,
+#                     point.padding = 0.2,
+#                     force = 2,
+#                     max.overlaps = Inf,
+#                     segment.color = "grey90",
+#                     segment.size = 0.3) +
+#   geom_hline(yintercept = 1, colour = "grey50", linetype = 2) +
+#   scale_color_manual(values = c("Not Significant" = "grey90", 
+#                                "Significant" = "red")) +
+#   facet_wrap(~ ano, nrow = 2, scales = "free_x", shrink = F ) +
+#   theme_minimal() +
+#   theme(
+#     plot.title = element_text(hjust = 0.5),
+#     plot.subtitle = element_text(hjust = 0.5),
+#     strip.text = element_text(face = "bold"),
+#     axis.text.x = element_blank(),
+#     legend.position = "none"
+#   ) +
+#   xlab(NULL)
+# 
+# print(p)
+
+# ano 2024
+p2 <- ggplot(d_sort[which(d_sort$ano==2024),], aes(x = cc_rank, y = RR6)) +
+  geom_errorbar(aes(ymin = LL6, ymax = UL6,
+                    color = ifelse(LL6 >= 1, "*", "n.s.")), 
+                width = 0.4, 
+                alpha = 0.7) +
+  geom_point(aes(color = ifelse(LL6 >= 1, "*", "n.s.")), size = 1.5) +
+  geom_text_repel(data = subset(d_sort[which(d_sort$ano==2024),], LL6 >= 1),
+                    aes(label = cc), 
+                    size = 2.5,
+                    color = "black",
+                    box.padding = 0.3,
+                    point.padding = 0.2,
+                    force = 2,
+                    max.overlaps = Inf,
+                    segment.color = "grey60",
+                    segment.size = 0.3) +
+  geom_hline(yintercept = 1, colour = "grey50", linetype = 2) +
+  scale_color_manual(values = c("n.s." = "grey60", 
+                               "*" = "red")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_blank(),
+    legend.position = "none"
+  ) +
+  xlab(NULL)
+p2
+```
+
+Vejamos agora os padrões espaciais do RR em Portugal, ampliando depois o mapa para visualizar com mais detalhe as regiões de Lisboa (que inclui concelhos densamente povoados) e a região do Sul. A par dos mapas de RR apresentam-se os mapas dos limites inferior (LInf) e superior (LSup) do IC95%.
+
+```{r mapa-RR2024}
+
+rr24 <- d %>% filter(ano == 2024) %>% pull(RR6)
+ll24 <- d %>% filter(ano == 2024) %>% pull(LL6)
+ul24 <- d %>% filter(ano == 2024) %>% pull(UL6)
+
+d_gis$RR6 <- rr24
+d_gis$LL6 <- ll24
+d_gis$UL6 <- ul24
+
+RRLeg <- ggplot(d_gis) + 
+  # geom_sf(aes(fill = delta)) +
+  geom_sf(aes(fill = RR6)) +
+  theme_bw() +
+  ggtitle("RR") + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "RR")
+legenda <- get_legend(RRLeg)
+
+RR6plot <- ggplot(d_gis) + 
+  # geom_sf(aes(fill = delta)) +
+  geom_sf(aes(fill = RR6)) +
+  theme_bw() +
+  ggtitle("RR") + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "RR")
+
+LL6plot <- ggplot(d_gis) + 
+  # geom_sf(aes(fill = delta)) +
+  geom_sf(aes(fill = LL6)) +
+  theme_bw() +
+  ggtitle("LInf") + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "LInf")
+
+UL6plot <- ggplot(d_gis) + 
+  geom_sf(aes(fill = UL6)) +
+  theme_bw() +
+  ggtitle("LSup") +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "LSup")
+
+# ----- zoom AL -----
+
+RR6_zoom <- ggplot(d_gis) + 
+  geom_sf(aes(fill = RR6)) +
+  theme_bw() +
+  ggtitle("RR (Sul)") + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(), 
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "ALit (LInf)") +
+  coord_sf(xlim = c(-80000, 60000), ylim = c(-300000, -180000))
+
+LL6_zoom <- ggplot(d_gis) + 
+  geom_sf(aes(fill = LL6)) +
+  theme_bw() +
+  ggtitle("LInf") + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "LInf") +
+  coord_sf(xlim = c(-80000, 60000), ylim = c(-300000, -180000))
+
+UL6_zoom <- ggplot(d_gis) + 
+  geom_sf(aes(fill = UL6)) +
+  theme_bw() +
+  ggtitle("LSup") + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "LSup") +
+  coord_sf(xlim = c(-80000, 60000), ylim = c(-300000, -180000))
+
+# ----- zoom Lx -----
+
+RR6_zoom2 <- ggplot(d_gis) + 
+  geom_sf(aes(fill = RR6)) +
+  theme_bw() +
+  ggtitle("RR (AML)") + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "LInf") +
+  coord_sf(xlim = c(-119000, -60000), ylim = c(-140000, -80000))
+
+LL6_zoom2 <- ggplot(d_gis) + 
+  geom_sf(aes(fill = LL6)) +
+  ggtitle("LInf") + 
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "LInf") +
+  coord_sf(xlim = c(-119000, -60000), ylim = c(-140000, -80000))
+
+UL6_zoom2 <- ggplot(d_gis) + 
+  geom_sf(aes(fill = UL6)) +
+  ggtitle("LSup") + 
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red") +
+  labs(fill = "LSup") +
+  coord_sf(xlim = c(-119000, -60000), ylim = c(-140000, -80000))
+```
+
+```{r mapa-RR2024-RR}
+plot_grid(RR6plot, LL6plot, UL6plot, legenda,  ncol = 4, rel_widths = c(1, 1, 1, 0.3))
+```
+
+```{r mapa-RR-Lx}
+plot_grid(RR6_zoom2, LL6_zoom2, UL6_zoom2, legenda,  ncol = 4, rel_widths = c(1, 1, 1, 0.3))
+# plot_grid(dplot, dplot_zoom, ncol = 2)
+```
+
+```{r mapa-RR2024-LL}
+plot_grid(RR6_zoom, LL6_zoom, UL6_zoom, legenda,  ncol = 4, rel_widths = c(1, 1, 1, 0.3))
+```
+
+
+
+
+
+```{r saveRDS, eval = T}
+# mapas SIR (RR1 e RR2 falta o merge)
+saveRDS(mapa, file = "mapa_SMR.rds")
+saveRDS(m1_res, file = "mapa_RR1.rds")
+saveRDS(m2_res, file = "mapa_R2.rds")
+saveRDS(m3_res, file = "mapa_R3.rds")
+saveRDS(m4_res, file = "mapa_R4.rds")
+saveRDS(m5_res, file = "mapa_R5.rds")
+
+# tabelas SIR e RR
+saveRDS(rr_table, file = "tabela_rr6.rds")
+
+```
+
+```{r readRDS, eval =F}
+# mapas SIR (RR1 e RR2 falta o merge)
+out_smr <- readRDS("mapa_SMR.rds")
+out_cal_rr1 <- readRDS("mapa_RR1.rds")
+out_cal_rr2 <- readRDS("mapa_R2.rds")
+
+# tabelas SIR e RR
+out_tbl_smr <- readRDS("tabela_SMR.rds")
+out_tbl_rr1 <-readRDS("tabela_RR1.rds")
+out_tbl_rr2 <-readRDS("tabela_RR2.rds")
+
+```
+
+
+```{r, eval = F}
+out_cal_rr2$summary.fixed %>%
+    kable(format = "html", escape = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                  full_width = FALSE,
+                  font_size = 12) %>%
+    scroll_box(width = "100%", height = "400px")
+```
+
+
+```{r, eval = F}
+
+# Extract fixed effects (including covariate parameter)
+fixed_effects <- out_cal_rr2$summary.fixed
+
+# Plot covariate parameter posterior distribution
+plot_covariate_posterior <- function(result, covariate_name = NULL) {
+  # If covariate name not specified, use the second row (assuming first is intercept)
+  if(is.null(covariate_name)) {
+    covariate_idx <- 2
+    covariate_name <- rownames(fixed_effects)[2]
+  } else {
+    covariate_idx <- which(rownames(fixed_effects) == covariate_name)
+  }
+
+  # Extract marginal distribution for the covariate
+  marg_covariate <- result$marginals.fixed[[covariate_idx]]
+
+  # Convert to data frame for plotting
+  df_covariate <- data.frame(
+    x = marg_covariate[,1],
+    density = marg_covariate[,2]
+  )
+
+  # Create plot
+  p1 <- ggplot(df_covariate, aes(x = x, y = density)) +
+    geom_line() +
+    geom_area(alpha = 0.3, fill = "grey") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    geom_vline(xintercept = fixed_effects[covariate_idx, "mean"],
+               linetype = "solid", color = "darkblue") +
+    labs(title = paste("Distribuição à posteriori -", covariate_name),
+         x = "Valor do parâmetro EDI SCORE", y = "Densidade") +
+    theme_bw()
+
+  
+  return(p1)
+}
+
+plot_covariate_posterior(result= out_cal_rr2, covariate_name = "EDI_SCORE" )
+```
+
+
+
+```{r output-artigo, eval = F}
+
+
+# ------ variancia dos efeitos aleatorios -------
+
+# m1
+# m1 - componente espacial (Besag)
+tau_besag_m1 <- m1_res$summary.hyperpar["Precision for idarea", "mean"]
+var_besag_m1 <- round(1 / tau_besag_m1, 3)
+# m1 - componente espacial (iid)
+tau_iid_m1 <- m1_res$summary.hyperpar["Precision for idarea1", "mean"]
+var_iid_m1 <- round(1 / tau_iid_m1,3)
+# m1 - compoenten temporal (rw1)
+tau_temporal_m1 <- m1_res$summary.hyperpar["Precision for idtime", "mean"]
+var_temporal_m1 <- round(1 / tau_temporal_m1,3)
+
+# m4
+# m4 - componente espacial (Besag)
+tau_besag_m4 <- m4_res$summary.hyperpar["Precision for idarea", "mean"]
+var_besag_m4 <- round(1 / tau_besag_m4,3)
+# m4 - componente espacial (IID)
+tau_iid_m4 <- m4_res$summary.hyperpar["Precision for idarea1", "mean"]
+var_iid_m4 <- round(1 / tau_iid_m4,3)
+# m4 - componente temporal (rw1)
+tau_temporal_m4 <- m4_res$summary.hyperpar["Precision for idtime", "mean"]
+var_temporal_m4 <- round(1 / tau_temporal_m4,3)
+
+# tabela
+comparison_df <- data.frame(
+  Component = c("Espacial", "Espacial (iid)", "Temporal"),
+  Modelo_1 = c(var_besag_m1, var_iid_m1, var_temporal_m1),
+  Modelo_4 = c(var_besag_m4, var_iid_m4, var_temporal_m4)
+)
+
+# IC95%
+m1_res$summary.hyperpar
+m4_res$summary.hyperpar
+
+# ----- distribuições à posteriori -----
+
+# Custom function to transform precision marginal to SD marginal
+transform_precision_to_sd <- function(precision_marginal) {
+  # Extract precision values and densities
+  precision_values <- precision_marginal[, 1]
+  precision_densities <- precision_marginal[, 2]
+  
+  # Transform precision to standard deviation
+  sd_values <- sqrt(1 / precision_values)
+  
+  # Apply Jacobian transformation for the densities
+  # If Y = g(X) = sqrt(1/X), then f_Y(y) = f_X(g^(-1)(y)) * |dg^(-1)/dy|
+  # g^(-1)(y) = 1/y^2, so |dg^(-1)/dy| = 2/y^3
+  sd_densities <- precision_densities * (2 / (sd_values^3))
+  
+  # Return as matrix similar to INLA format
+  result <- cbind(sd_values, sd_densities)
+  colnames(result) <- c("x", "y")
+  
+  return(result)
+}
+
+# Apply to your marginals
+sd_besag_m1 <- transform_precision_to_sd(m1_res$marginals.hyperpar$`Precision for idarea`)
+sd_iid_m1 <- transform_precision_to_sd(m1_res$marginals.hyperpar$`Precision for idarea1`)
+sd_temporal_m1 <- transform_precision_to_sd(m1_res$marginals.hyperpar$`Precision for idtime`)
+
+sd_besag_m4 <- transform_precision_to_sd(m4_res$marginals.hyperpar$`Precision for idarea`)
+sd_iid_m4 <- transform_precision_to_sd(m4_res$marginals.hyperpar$`Precision for idarea1`)
+sd_temporal_m4 <- transform_precision_to_sd(m4_res$marginals.hyperpar$`Precision for idtime`)
+
+# Now create your plots
+library(ggplot2)
+
+# Create plotting data
+create_marginal_df <- function(marginal, component, model) {
+  data.frame(
+    x = marginal[, 1],
+    y = marginal[, 2],
+    Component = component,
+    Model = model
+  )
+}
+
+# Combine all marginals
+plot_data <- rbind(
+  create_marginal_df(sd_besag_m1, "Structured Spatial", "Model 1"),
+  create_marginal_df(sd_iid_m1, "Unstructured Spatial", "Model 1"),
+  create_marginal_df(sd_temporal_m1, "Temporal", "Model 1"),
+  create_marginal_df(sd_besag_m4, "Structured Spatial", "Model 4"),
+  create_marginal_df(sd_iid_m4, "Unstructured Spatial", "Model 4"),
+  create_marginal_df(sd_temporal_m4, "Temporal", "Model 4")
+)
+
+# Create the plot
+p <- ggplot(plot_data, aes(x = x, y = y, color = Model, linetype = Model)) +
+  geom_line(size = 1) +
+  facet_wrap(~ Component, scales = "free") +
+  labs(
+    title = "Posterior Distributions of Standard Deviations",
+    subtitle = "Comparison between Model 1 and Model 4",
+    x = "Standard Deviation",
+    y = "Posterior Density"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("Model 1" = "#E31A1C", "Model 4" = "#1F78B4")) +
+  scale_linetype_manual(values = c("Model 1" = "solid", "Model 4" = "dashed"))
+
+print(p)
+
+
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<
+# componente espacial precisao
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+# Function to calculate spatial variance components
+calculate_spatial_components <- function(model_res, model_name) {
+  # Extract variances (1/precision)
+  var_besag <- 1 / model_res$summary.hyperpar["Precision for idarea", "mean"]
+  var_iid <- 1 / model_res$summary.hyperpar["Precision for idarea1", "mean"]
+  var_temporal <- 1 / model_res$summary.hyperpar["Precision for idtime", "mean"]
+  
+  # Total spatial variance
+  total_spatial_var <- var_besag + var_iid
+  total_var <- var_besag + var_iid + var_temporal
+  
+  # Proportions
+  prop_structured <- var_besag / total_spatial_var
+  prop_unstructured <- var_iid / total_spatial_var
+  
+  # Spatial autocorrelation relevance
+  spatial_autocorr_strength <- var_besag / total_var
+  spatial_noise_strength <- var_iid / total_var
+  
+  return(data.frame(
+    Model = model_name,
+    Var_Structured = var_besag,
+    Var_Unstructured = var_iid,
+    Var_Temporal = var_temporal,
+    Total_Spatial_Var = total_spatial_var,
+    Total_Var = total_var,
+    Prop_Structured_in_Spatial = prop_structured,
+    Prop_Unstructured_in_Spatial = prop_unstructured,
+    Spatial_Autocorr_Strength = spatial_autocorr_strength,
+    Spatial_Noise_Strength = spatial_noise_strength
+  ))
+}
+
+# Calculate for both models
+spatial_comp_m1 <- calculate_spatial_components(m1_res, "Model 1")
+spatial_comp_m4 <- calculate_spatial_components(m4_res, "Model 4")
+
+spatial_comparison <- rbind(spatial_comp_m1, spatial_comp_m4)
+
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# Calculate the "Spatial Autocorrelation Ratio"
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+calculate_autocorr_ratio <- function(model_res) {
+  var_besag <- 1 / model_res$summary.hyperpar["Precision for idarea", "mean"]
+  var_iid <- 1 / model_res$summary.hyperpar["Precision for idarea1", "mean"]
+  
+  # Ratio of structured to total spatial variance
+  autocorr_ratio <- var_besag / (var_besag + var_iid)
+  
+  return(autocorr_ratio)
+}
+
+autocorr_ratio_m1 <- calculate_autocorr_ratio(m1_res)
+autocorr_ratio_m4 <- calculate_autocorr_ratio(m4_res)
+
+
+round(autocorr_ratio_m1, 3)
+round(autocorr_ratio_m4, 3)
+
+
+#<<<<<<<<<<<<<
+# visualização das componentes espaciais
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Create data for plotting
+spatial_plot_data <- spatial_comparison %>%
+  dplyr::select(Model, Var_Structured, Var_Unstructured, Var_Temporal) %>%
+  pivot_longer(cols = c(Var_Structured, Var_Unstructured, Var_Temporal),
+               names_to = "Component", values_to = "Variance") %>%
+  mutate(Component = case_when(
+    Component == "Var_Structured" ~ "Structured Spatial\n(Autocorrelated)",
+    Component == "Var_Unstructured" ~ "Unstructured Spatial\n(Independent)",
+    Component == "Var_Temporal" ~ "Temporal"
+  ))
+
+# Stacked bar chart
+p1 <- ggplot(spatial_plot_data, aes(x = Model, y = Variance, fill = Component)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Variance Decomposition: Spatial Autocorrelation Assessment",
+    subtitle = "Structured vs Unstructured Spatial Components",
+    y = "Variance",
+    fill = "Component"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = c(
+    "Structured Spatial\n(Autocorrelated)" = "#E31A1C",
+    "Unstructured Spatial\n(Independent)" = "#FF7F00", 
+    "Temporal" = "#1F78B4"
+  ))
+
+print(p1)
+
+# Proportional chart focusing on spatial components only
+spatial_only_data <- spatial_comparison %>%
+  dplyr::select(Model, Prop_Structured_in_Spatial, Prop_Unstructured_in_Spatial) %>%
+  pivot_longer(cols = c(Prop_Structured_in_Spatial, Prop_Unstructured_in_Spatial),
+               names_to = "Component", values_to = "Proportion") %>%
+  mutate(Component = case_when(
+    Component == "Prop_Structured_in_Spatial" ~ "Structured\n(Autocorrelated)",
+    Component == "Prop_Unstructured_in_Spatial" ~ "Unstructured\n(Independent)"
+  ))
+
+p2 <- ggplot(spatial_only_data, aes(x = Model, y = Proportion, fill = Component)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Spatial Variance Partitioning",
+    subtitle = "Proportion of Spatial Variance: Autocorrelated vs Independent",
+    y = "Proportion of Total Spatial Variance",
+    fill = "Spatial Component"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = c(
+    "Structured\n(Autocorrelated)" = "#E31A1C",
+    "Unstructured\n(Independent)" = "#FF7F00"
+  )) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.7) +
+  annotate("text", x = 1.5, y = 0.52, label = "Equal contribution", alpha = 0.7)
+
+print(p2)
+```
+
+
