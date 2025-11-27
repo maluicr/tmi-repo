@@ -408,43 +408,40 @@ mall_res <- data.frame(Modelo = mall_name, DIC = dicval, WAIC = waicval)
 ```
 
 
-### Efeitos fixos
+#### Efeitos fixos
 
-Para a tendência global especificou-se uma distribuição gaussiana de média nula e baixa precisão:
-
+Para a tendência global especificou-se uma distribuição gaussiana não-informativa de média nula e precisão $\tau= 1/\sigma^2=$ `control.fixed$prec.intercept`.
 $$
 \alpha \sim N(`r control.fixed$mean.intercept`, `r 1/control.fixed$prec.intercept`)
 $$
 
-Para o índice EDI especificou-se uma prior informativa com a seguinte distribuição:  
-
+Para o parãmetro associado ao índice EDI especificou-se uma prior informativa com distribuição gaussiana:  
 $$
-\beta_{EDI} \sim N(`r control.fixed$mean`, `r control.fixed$prec`)
+\beta_{EDI} \sim N(`r control.fixed$mean`, `r 1/control.fixed$prec`)
 $$
+assumindo à priori a expectativa de uma associação positiva entre a privação socio-económica e a mortalidade infantil.
 
-### Efeitos aleatórios
+#### Efeitos aleatórios
 
-Para a estrutura espacial especificou-se uma combinação de *priors* de complexidade penalizada, com componente estruturada e uma componente não estruturada no espaço, que combina uma *prior* com modelo condicional autoregressivo (CAR) e um modelo gaussiano i.i.d para as componentes com e sem estrutura espacial, respectivamente. 
+As distribuições a priori para os hiperparâmetros dos efeitos aleatórios foram especificadas usando priors de complexidade penalizada (PC priors). 
 
-Para a precisão $\tau= 1/\sigma^2$ da componente espacial considera-se uma distribuição à priori $\tau \sim \text{Gamma}(a,b)$ com parâmetros $a,b$ que satisfazem a condição seguinte:
+Para a componente espacial ($u_i+v_i$) adoptou-se o modelo BYM2 (Besag-York-Mollié) especificado com uma combinação de *priors* com componente estruturada, $u_i$, e componente não-estruturada,  $v_i$, onde $u_i$ segue um modelo condicional autoregressivo intrinseco (iCAR) e $v_i$ segue uma distribuição gaussiana de média nula e variancia unitária. 
 
-$$
-P(\sigma>`r hyper.bym2$prec$param[1]`)= `r hyper.bym2$prec$param[2]`
-$$
-ou seja, com probabilidade 1% do desvio-padrão ser maior que 0.5.
+Para a precisão marginal desta compontente especificou-se uma distribuição $\tau_\varepsilon \sim \text{Gamma}(a,b)$ com parâmetros $a,b$ que favorecem uma baixa variabilidade espacial no contecto da mortalidade infantil.
 
-Para a autocorrelação espacial considera-se uma distribuição $\text{Beta} \sim (\alpha,\beta)$ com parâmetros $\alpha,\beta$ que satisfazem a condição de mais de metade da autocorrelação espacial ter probabilidade de 60%:
+Para o parâmetro associado à autocorrelação espacial especificou-se uma distribuição $\text{Beta} \sim (\alpha,\beta)$ com parâmetros $\alpha,\beta$ assumindo que à priori, a componente não-estruturada da variabilidade espacial é dominante (sobre a estruturada). Os hiperparâmetros associados são determinados pela condição:
 
 $$
 P(\phi> `r hyper.bym2$phi$param[2]`)=`r hyper.bym2$phi$param[2]`
 $$
 
-Para a estrutura temporal especificou-se um passeio aleatório (*random walk*) de primeira ordem com erros aleatórios gaussianos $\varepsilon \sim \text{N}(0,\sigma^2)$ e uma precisão elevada (i.e. desvio padrão reduzido):
+Para a estrutura temporal especificou-se um passeio aleatório (*random walk*, RW1) de primeira ordem com erros aleatórios gaussianos $\varepsilon \sim \text{N}(0,\sigma^2)$ e uma precisão elevada (i.e. desvio padrão reduzido):
 
 $$
 P(\sigma>`r hyper.temporal$prec$param[1]`)=`r hyper.temporal$prec$param[2]`
 $$
-Para a precisão dos erros especificou-se a distribuição $\tau_\varepsilon \sim \text{Gamma}(a,b)$ com parâmetros $a,b$ que favorecem uma evolução temporal suave, i.e., com probabilidade de 1% de exceder 0.1 (i.e. variação anual do risco relativo entre $-10\%$ e $11\%$:
+
+Para a precisão desta componente especificou-se a distribuição $\tau_\varepsilon \sim \text{Gamma}(a,b)$ com parâmetros $a,b$ que favorecem uma evolução temporal suave, i.e., com probabilidade de 1% de exceder 0.1 (i.e. variação anual do risco relativo entre $-10\%$ e $11\%$:
 
 ## Resultados
 
@@ -501,7 +498,7 @@ df_tmi %>%
 
 Verifica-se que as taxas mais elevadas ocorreram em concelhos com poucos nascimentos (nados-vivos) por ano (e.g Mora, Fornos de Algodres). 
 
-```{r smr-time-plot}
+```{r smr-time-plot, out.width="50%"}
 # time series
 gt <- ggplot(d, aes(x = ano, y = tmi, group = cc, color = cc)) +
   geom_line() +
@@ -512,7 +509,7 @@ gt <- ggplot(d, aes(x = ano, y = tmi, group = cc, color = cc)) +
 library(gghighlight)
 gh <- gt + gghighlight(cc %in% c("Lisboa","Mora", "Fornos de Algodres", "Porto"))
 gh
-ggsave("ts-cc.png")
+# ggsave("ts-cc.png")
 ```
 
 
@@ -576,7 +573,7 @@ m1_sum %>%
 
 No gráfico seguinte ilustra-se o impacto da tendência temporal linear global no RR, representada pela média da distribuição à posteriori de $\beta$ e respetivos limites inferior e superior para um IC95%.
 
-```{r m1-betaplot}
+```{r m1-betaplot, out.width="50%"}
 
 m1_betaplot <- m1_res$summary.fixed[2,1:5]
 beta_mean <- m1_betaplot["idtime", "mean"]
@@ -631,7 +628,7 @@ delta <- unlist(lapply(m2_mar_delta,function(x)inla.emarginal(exp,x)), use.names
 
 Os mapas seguintes ilustram as médias da distribuição à posteriori de $\zeta_i = \exp(u_i+v_i)$ (esq.) e de $\exp(\delta_i)$ (dir.).
 
-```{r m2-mapas-pt, fig.cap="Médias da distribuição à posteriori para o efeito aleatório da componentes espacial (esq.) e para efeito do tempo em cada local (dir.)", fig.align='center'}
+```{r m2-mapas-pt, fig.cap="Médias da distribuição à posteriori para o efeito aleatório da componentes espacial (esq.) e para efeito do tempo em cada local (dir.)", fig.align='center', out.width="50%"}
 d_gis <- pt_gis
 
 d_gis$zeta <- zeta
@@ -667,7 +664,7 @@ plot_grid(zplot, dplot, ncol = 2)
 ggsave("m2-mapas-pt-1.png")
 ```
 
-No mapa de $\zeta$ (componente espacial) identifica-se uma tendência para os efeitos serem mais elevados na região de Lisboa e região Sul. Na distribuição de $\exp(\delta_i)$ identifica-se um aumento dos RR entre anos consecutivos mais acentuado em alguns concelhos destas regiões. Os mapas seguintes apresentam com mais detalhe os mapas de $\zeta$ e $\exp(\delta_i)$ para a região de Lisboa e Sul de Portugal. 
+No mapa de $\zeta$ (componente espacial) identifica-se uma tendência para os efeitos serem mais elevados na região de Lisboa e região Sul. Na distribuição de $\exp(\delta_i)$ identifica-se um aumento dos RR entre anos consecutivos mais acentuado em alguns concelhos destas regiões. Os mapas seguintes apresentam com mais detalhe os mapas de $\zeta$ e $\exp(\delta_i)$ para a região de Lisboa. 
 
 
 ```{r m2-mapas-zoom, fig.cap="Zoom do mapa da esq. para a região de Lisboa e do mapa da dir. para o Alentejo", fig.align='center'}
@@ -799,7 +796,6 @@ df <- data.frame(x = marginal[,1], y = marginal[,2])
 summary_stats <- m6_res$summary.fixed["EDI_SCORE", ]
 
 ```
-
 
 Em relação à covariável EDI considerada em M6, os resultados da análise indicam que o aumento do indice de privação sugere um aumento significativo no RR de mortalidade infantil `r round((exp(m6_res$summary.fixed["EDI_SCORE","mean"])-1) * 100,2)`% (IC 95%:`r round((exp(m6_res$summary.fixed["EDI_SCORE",c("0.025quant", "0.975quant")])-1) *100,1)`%).
 
