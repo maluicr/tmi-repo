@@ -1059,3 +1059,10 @@ p2 <- ggplot(d_sort[which(d_sort$ano==2024),], aes(x = cc_rank, y = RR6)) +
 p2
 ```
 
+## Conclusões
+
+Os modelos M6 e M7 forneceram estimativas suavizadas dos efeitos não lineares espaciais (BYM2) e temporais (RW1) no mapeamento do risco relativo de mortalidade infantil, permitindo identificar tendências particularmente importantes, nomeadamente na identificação de concelhos com riscos significativamente elevados (p.e. Amadora, Barreiro e Odemira em 2024). Usou-se uma abordagem Bayesiana com INLA para ultrapassar as limitações computacionais dos métodos tradicionais. Esta abordagem permitiu obter distribuições marginais a posteriori de forma rápida e precisa.
+
+A inclusão da variável de efeito de interação (EDI) melhorou significativamente o ajuste dos modelos M5-M7 em comparação com os modelos M2-M4, demonstrando que, controlando os efeitos espaciais e temporais, um aumento de uma unidade no índice de privação está associado a um aumento de 3,7% (IC95%: 1,4%-5,9%) no risco relativo de mortalidade infantil (conforme resultado observado no modelo M6). 
+
+A comparação entre modelos revelou que os modelos M6 e M7 apresentam os melhores ajustamentos, mas que a inclusão da interação espaço-temporal (M7) não proporcionou melhorias substanciais em relação ao modelo M6, sugerindo que a interação não é significativa na variação do risco. Estudos adicionais são necessários para avaliar se esta conclusão se mantém em análises com períodos temporais mais longos ou contextos com maior heterogeneidade espaço-temporal.
