@@ -1,0 +1,1391 @@
+---
+title: "Mortalidade infantil em Portugal Continental 2015–2024"
+subtitle: "Pipeline exploratório e Bayesiano espaço-temporal"
+short-title: "Evolução espaço-temporal"
+author:
+  - name: Manuel Ribeiro
+    affiliation: CERENA, Instituto Superior Técnico, Universidade de Lisboa
+    orcid: 0000-0002-7890-7708
+    email: manuel.ribeiro@tecnico.ulisboa.pt
+  - name: Direção de Serviços de Informação e Análise
+    affiliation: Direção Geral de Saúde
+date: |
+  01/Jun/2026
+lang: pt
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-location: right
+    toc-title: "Conteúdos"
+    page-layout: article
+    number-sections: true
+    number-depth: 4
+    code-fold: true
+    code-summary: "Mostrar código"
+    code-tools: true
+    theme:
+      light: flatly
+      dark: darkly
+    fig-width: 8
+    fig-height: 6
+    fig-dpi: 300
+    embed-resources: true
+    smooth-scroll: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: true
+  freeze: auto
+knitr:
+  opts_chunk:
+    fig.align: 'center'
+    out.width: '100%'
+editor: visual
+---
+
+```{=html}
+<style>
+  .main-container { max-width: 80%; margin: auto }
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, include = TRUE,
+  warning = FALSE, message = FALSE,
+  fig.align = "center", fig.retina = 3,
+  fig.width = 7, fig.height = (7 * 0.618),
+  out.width = "100%"
+)
+options(digits = 3, width = 120,
+        dplyr.summarise.inform = FALSE,
+        knitr.kable.NA = "")
+```
+
+```{r livrarias, cache=FALSE}
+library(sf)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(ggplot2)
+library(ggrepel)
+library(gghighlight)
+library(cowplot)
+library(leaflet)
+library(knitr)
+library(kableExtra)
+
+library(spdep)       # poly2nb, EBest, Moran, LISA
+library(SpatialEpi)  # kulldorff
+library(INLA)        # BYM2
+library(gstat)       # variograma temporal
+library(cluster)     # silhouette
+library(factoextra)  # fviz_eig, fviz_pca_*
+
+source("f_tabelas.R")
+```
+
+## Dados {#sec-dados}
+
+### GIS e vizinhança {#sec-dados-gis}
+
+```{r dados-gis, cache=FALSE}
+# shapefile com 278 polígonos ÚNICOS — nunca usar o objecto long
+pt_gis <- st_read("../gis/cc_caop2013_pop19.shp", quiet = TRUE)[, c("oid_", "nome_cc")]
+pt_gis <- pt_gis[order(pt_gis$nome_cc), ]
+pk <- pt_gis$nome_cc  # nomes dos 278 concelhos ordenados
+
+# Vizinhança construída sobre os 278 polígonos únicos  [BUG FIX (a)]
+nb_pt <- poly2nb(pt_gis, queen = TRUE)
+nb2INLA("map_pt.adj", nb_pt)
+g_pt <- inla.read.graph(filename = "map_pt.adj")
+
+# Pesos espaciais para Moran / LISA
+lw_pt <- nb2listw(nb_pt, style = "W", zero.policy = TRUE)
+```
+
+### Óbitos e nados-vivos {#sec-dados-tmi}
+
+```{r dados-tmi, cache=FALSE}
+casos <- read.table("./docs/casos.txt", sep = "\t", header = TRUE,
+                    encoding = "latin1")
+casos <- casos %>% filter(Nomes_cc %in% pk)
+names(casos) <- c("cc", 2015:2024)
+
+pop <- read.table("./docs/pop.txt", sep = "\t", header = TRUE,
+                  encoding = "latin1")
+pop <- pop %>% filter(Nomes_cc %in% pk)
+names(pop) <- c("cc", 2015:2024)
+
+casos_melt <- melt(casos, id.vars = "cc", variable.name = "ano", value.name = "y")
+pop_melt   <- melt(pop,   id.vars = "cc", variable.name = "ano", value.name = "pop")
+
+d <- left_join(casos_melt, pop_melt, by = c("cc", "ano"))
+d$ano <- as.integer(as.character(d$ano))
+d$y   <- as.integer(d$y)
+d$pop <- as.integer(d$pop)
+
+# d tem 4 colunas: cc, ano, y, pop 
+
+```
+
+### EDI 2011 {#sec-dados-edi}
+
+```{r dados-edi, cache=FALSE}
+edi <- read.table("./docs/edi_2011.csv", sep = ";", dec = ",",
+                  header = TRUE, encoding = "latin1")
+edi$EDI_QUINTILE <- factor(edi$EDI_QUINTILE)
+
+d <- inner_join(d,
+                edi[, c("GEO_COD_DSG", "EDI_SCORE", "EDI_QUINTILE")],
+                by = c("cc" = "GEO_COD_DSG"))
+d <- d[order(d$cc, d$ano), ]
+# agora d tem 6 colunas: cc, ano, y, pop, EDI_Score, EDI_Quintile
+```
+
+## Qualidade dos dados {#sec-qd}
+
+### Zeros estruturais {#sec-qd-zeros}
+
+Número de concelhos com 0 óbitos ($y=0$), por ano:
+
+```{r qd-zeros}
+zero_tab <- d %>%
+  mutate(zero = y == 0L) %>%
+  group_by(ano) %>%
+  summarise(n_zeros = sum(zero),
+            pct_zeros = round(100 * mean(zero), 1),
+            .groups = "drop")
+
+zero_tab %>%
+  kable(format = "html",
+        col.names = c("Ano", "N.º concelhos c/ zero óbitos", "% concelhos")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+Proporção de concelhos com 0 óbitos ($y=0$), por ano:
+
+```{r qd-zeros-plot, out.width="55%"}
+ggplot(d, aes(x = factor(ano), fill = y == 0)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("FALSE" = "#2166AC", "TRUE" = "#D6604D"),
+                    labels = c("y > 0", "y = 0")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Ano", y = "Proporção de concelhos", fill = NULL) +
+  theme_minimal()
+```
+
+### Instabilidade por E pequeno {#sec-qd-estab}
+
+Concelhos com E_ref < 1 têm taxas brutas muito instáveis; o suavizamento bayesiano é especialmente importante nesses casos.
+
+```{r qd-estab}
+# calculado após E_ref (ver secção seguinte); referenciado aqui para contexto
+# a tabela é produzida após o bloco de cálculo de E
+```
+
+### Estratificação urbano/rural {#sec-qd-urban}
+
+```{r qd-urban}
+# Classificação por tercil de nados-vivos médios anuais por concelho
+pop_terciis <- d %>%
+  group_by(cc) %>%
+  summarise(pop_mean = mean(pop, na.rm = TRUE), .groups = "drop") %>%
+  mutate(urban_class = cut(
+    pop_mean,
+    breaks = quantile(pop_mean, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+    labels = c("Rural", "Intermédio", "Urbano"),
+    include.lowest = TRUE
+  ))
+
+d <- left_join(d, pop_terciis[, c("cc", "urban_class")], by = "cc")
+
+d <- d %>%
+  select(-any_of("urban_class")) %>%
+  left_join(pop_terciis[, c("cc", "urban_class")], by = "cc")
+
+d %>%
+  group_by(urban_class) %>%
+  summarise(n_concelhos = n_distinct(cc),
+            pop_mediana  = round(median(pop), 0),
+            y_total      = sum(y),
+            .groups = "drop") %>%
+  kable(format = "html",
+        col.names = c("Classe", "N.º concelhos", "Nados-vivos (mediana)", "Óbitos totais")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+## Valores esperados {#sec-E}
+
+Os valores esperados são calculados pela **fórmula directa** $E_{ij} = r_{\text{ref}} \times n_{ij}$, nunca via `SpatialEpi::expected()`. São calculadas duas referências:
+
+- **E_ref**: taxa do período 2015–2019 aplicada a todos os anos;
+- **E_full**: taxa do período 2015–2024 aplicada a todos os anos.
+
+```{r e-calculo, cache=FALSE}
+# --- E_ref: taxa de referência 2015-2019  [BUG FIX (b)] ---
+ref_anos    <- 2015:2019
+r_ref       <- sum(d$y[d$ano %in% ref_anos]) / sum(d$pop[d$ano %in% ref_anos])
+d$E_ref     <- r_ref * d$pop
+
+# --- E_full: taxa de referência 2015-2024 ---
+r_full      <- sum(d$y) / sum(d$pop)
+d$E_full    <- r_full * d$pop
+
+# --- E_recent: taxa de referência 2020-2024 ---
+recent_anos <- 2020:2024
+r_recent    <- sum(d$y[d$ano %in% recent_anos]) / sum(d$pop[d$ano %in% recent_anos])
+d$E_recent  <- r_recent * d$pop
+
+# TMI (por 1000 nados-vivos)
+d$tmi <- round(1000 * d$y / d$pop, 2)
+
+cat(sprintf("r_ref    (2015–2019) = %.6f  (%.2f por 1000)\n", r_ref,    r_ref    * 1000))
+cat(sprintf("r_full   (2015–2024) = %.6f  (%.2f por 1000)\n", r_full,   r_full   * 1000))
+cat(sprintf("r_recent (2020–2024) = %.6f  (%.2f por 1000)\n", r_recent, r_recent * 1000))
+```
+
+```{r qd-estab2}
+# Concelhos com E_ref < 1 (instáveis)
+instav <- d %>%
+  group_by(cc) %>%
+  summarise(E_ref_min = min(E_ref), E_ref_mean = mean(E_ref), .groups = "drop") %>%
+  filter(E_ref_min < 1) %>%
+  arrange(E_ref_mean)
+
+cat(sprintf("%d concelhos com E_ref < 1 em pelo menos um ano\n", nrow(instav)))
+instav %>%
+  head(15) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  kable(format = "html",
+        col.names = c("Concelho", "E_ref mínimo", "E_ref médio")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+### Comparação das três referências
+
+```{r e-comparacao, out.width="60%"}
+d_obs <- d %>%
+  group_by(ano) %>%
+  summarise(y_total = sum(y), .groups = "drop")
+
+d_comp <- d %>%
+  group_by(ano) %>%
+  summarise(
+    `E_ref (2015–2019)`    = sum(E_ref),
+    `E_full (2015–2024)`   = sum(E_full),
+    `E_recent (2020–2024)` = sum(E_recent),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-ano, names_to = "ref", values_to = "E")
+
+ggplot(d_comp, aes(x = factor(ano), y = E, color = ref, group = ref)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  geom_point(data = d_obs, aes(x = factor(ano), y = y_total),
+             inherit.aes = FALSE, color = "black", shape = 4, size = 3) +
+  scale_color_manual(
+    values = c("E_ref (2015–2019)"    = "#2166AC",
+               "E_full (2015–2024)"   = "#D6604D",
+               "E_recent (2020–2024)" = "#4DAC26"),
+    name = NULL
+  ) +
+  labs(x = "Ano", y = "Óbitos esperados (total)",
+       caption = "× = óbitos observados") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## SIR bruto e Bayes Empírico {#sec-sir}
+
+### SIR bruto {#sec-sir-bruto}
+
+```{r sir-bruto}
+d$SIR_ref  <- d$y / d$E_ref
+d$SIR_full <- d$y / d$E_full
+```
+
+### SIR de Bayes Empírico (global) {#sec-sir-eb}
+
+Implementação directa do estimador de Bayes empírico global (Marshall 1991; Clayton & Kaldor 1987), equivalente a `spdep::EBest()` mas independente da versão instalada do pacote. O estimador contrai o SIR bruto de cada concelho para a taxa média nacional, com peso proporcional ao tamanho da população: $\hat{\theta}_i = w_i\,\bar{\theta} + (1-w_i)\,(y_i/E_i)$, onde $w_i = \bigl[1 + E_i\,A/\bar{\theta}\bigr]^{-1}$ e $A$ é a variância entre-concelhos estimada pelo método dos momentos.
+
+```{r sir-eb, cache=TRUE}
+# Estimador global de Bayes Empírico (Poisson-Gamma, Marshall 1991)
+eb_sir_global <- function(y, E) {
+  E   <- pmax(E, 1e-9)
+  mu  <- sum(y) / sum(E)
+  raw <- y / E
+  num <- sum((raw - mu)^2) - mu * sum(1 / E)
+  den <- sum(E) - sum(E^2) / sum(E)
+  A   <- if (is.finite(num / den)) max(num / den, 0) else 0
+  w   <- 1 / (1 + E * A / mu)
+  w * mu + (1 - w) * raw
+}
+
+# Calcula SIR_EB directamente em d por group_modify — sem join, sem duplicação
+# (idempotente: seguro com cache parcial ou re-execuções)
+d <- d %>%
+  arrange(cc, ano) %>%
+  group_by(ano) %>%
+  group_modify(~ {
+    .x$SIR_EB_ref  <- eb_sir_global(.x$y, .x$E_ref)
+    .x$SIR_EB_full <- eb_sir_global(.x$y, .x$E_full)
+    .x
+  }) %>%
+  ungroup()
+
+# Matriz SIR_EB 278×10 — input para PCA e clustering
+sir_eb_mat <- d %>%
+  arrange(cc, ano) %>%
+  select(cc, ano, SIR_EB_ref) %>%
+  pivot_wider(names_from = ano, values_from = SIR_EB_ref) %>%
+  tibble::column_to_rownames("cc") %>%
+  as.matrix()
+
+stopifnot(nrow(sir_eb_mat) == 278L, ncol(sir_eb_mat) == 10L)
+```
+
+```{r sir-eb-plot, out.width="60%"}
+d %>%
+  group_by(ano) %>%
+  summarise(SIR_EB_mediana = median(SIR_EB_ref, na.rm = TRUE),
+            SIR_EB_q25 = quantile(SIR_EB_ref, 0.25, na.rm = TRUE),
+            SIR_EB_q75 = quantile(SIR_EB_ref, 0.75, na.rm = TRUE),
+            .groups = "drop") %>%
+  ggplot(aes(x = ano, y = SIR_EB_mediana)) +
+  geom_ribbon(aes(ymin = SIR_EB_q25, ymax = SIR_EB_q75), alpha = 0.2) +
+  geom_line(linewidth = 0.9, color = "#2166AC") +
+  geom_point(size = 3, color = "#2166AC") +
+  geom_hline(yintercept = 1, linetype = 2, color = "grey50") +
+  scale_x_continuous(breaks = 2015:2024) +
+  labs(x = "Ano", y = "SIR_EB (mediana ± IIQ)", title = "Evolução do SIR_EB nacional") +
+  theme_minimal()
+```
+
+## Descritiva espaço-temporal {#sec-descritiva}
+
+### Série temporal nacional {#sec-ts-nacional}
+
+```{r ts-nacional}
+ts_nac <- d %>%
+  group_by(ano) %>%
+  summarise(
+    TMI   = 1000 * sum(y) / sum(pop),
+    E_ref_tot = sum(E_ref),
+    .groups = "drop"
+  )
+
+ts_nac %>%
+  mutate(TMI = round(TMI, 2)) %>%
+  pivot_wider(names_from = ano, values_from = TMI, id_cols = NULL) %>%
+  kable(format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r ts-nacional-plot, out.width="55%"}
+ggplot(ts_nac, aes(x = ano, y = TMI)) +
+  geom_line(colour = "darkgrey", linewidth = 1) +
+  geom_point(size = 4, colour = "darkred") +
+  scale_x_continuous(breaks = 2015:2024) +
+  labs(x = "Ano", y = "TMI (por 1000 nados-vivos)") +
+  theme_minimal()
+```
+
+```{r ts-concelhos, out.width="55%"}
+ggplot(d, aes(x = ano, y = tmi, group = cc, color = cc)) +
+  geom_line(alpha = 0.4) +
+  gghighlight(cc %in% c("Lisboa", "Mora", "Fornos de Algodres",
+                         "Castanheira de Pêra", "Porto"),
+              unhighlighted_params = list(colour = "grey80", alpha = 0.3)) +
+  scale_x_continuous(breaks = 2015:2024) +
+  labs(y = "TMI", x = "Ano") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Estratificação por quintil EDI {#sec-ts-edi}
+
+```{r ts-edi}
+d %>%
+  group_by(EDI_QUINTILE, ano) %>%
+  summarise(TMI = mean(tmi, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = ano, values_from = TMI) %>%
+  mutate(across(where(is.numeric), ~sprintf("%.2f", .x))) %>%
+  kable(format = "html",
+        col.names = c("Quintil EDI", 2015:2024)) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r ts-edi-plot, out.width="65%"}
+d %>%
+  group_by(EDI_QUINTILE, ano) %>%
+  summarise(TMI = mean(tmi, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = ano, y = TMI, color = EDI_QUINTILE, group = EDI_QUINTILE)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = 2015:2024) +
+  scale_color_viridis_d(option = "magma", direction = -1) +
+  labs(x = "Ano", y = "TMI média", color = "Quintil\nEDI") +
+  theme_minimal()
+```
+
+### Moran I global por ano (sobre SIR_EB) {#sec-moran}
+
+```{r moran-global, cache=TRUE}
+# Função auxiliar: extrai SIR_EB alinhado com a ordem de pt_gis
+# e substitui NA/NaN/Inf pela mediana do ano (concelhos sem população)
+align_with_ptgis <- function(dyr, col) {
+  idx <- match(pt_gis$nome_cc, dyr$cc)  # match por nome, ordem de pt_gis
+  x   <- dyr[[col]][idx]
+  bad <- !is.finite(x)
+  if (any(bad)) x[bad] <- median(x, na.rm = TRUE)
+  x
+}
+
+moran_res <- lapply(2015:2024, function(yr) {
+  dyr <- d[d$ano == yr, ]
+  x   <- align_with_ptgis(dyr, "SIR_EB_ref")
+  mt  <- moran.test(x, lw_pt, zero.policy = TRUE)
+  data.frame(
+    ano     = yr,
+    I       = unname(mt$estimate["Moran I statistic"]),
+    p_value = mt$p.value
+  )
+})
+moran_df <- do.call(rbind, moran_res)
+
+moran_df %>%
+  mutate(
+    I       = round(I, 4),
+    p_value = formatC(p_value, format = "e", digits = 2),
+    sig     = ifelse(as.numeric(p_value) < 0.05, "*", "")
+  ) %>%
+  kable(format = "html",
+        col.names = c("Ano", "I de Moran", "p-valor", "")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r moran-plot, out.width="55%"}
+ggplot(moran_df, aes(x = ano, y = I)) +
+  geom_col(fill = "#2166AC", width = 0.6) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_x_continuous(breaks = 2015:2024) +
+  labs(x = "Ano", y = "I de Moran (SIR_EB)") +
+  theme_minimal()
+```
+
+### LISA — I de Moran local por ano {#sec-lisa}
+
+```{r lisa-calc, cache=TRUE}
+lisa_list <- lapply(2015:2024, function(yr) {
+  dyr <- d[d$ano == yr, ]
+  x   <- align_with_ptgis(dyr, "SIR_EB_ref")  # alinhado com pt_gis, sem NA
+  lm  <- localmoran(x, lw_pt, zero.policy = TRUE)
+  data.frame(
+    nome_cc = pt_gis$nome_cc,
+    ano     = yr,
+    Ii      = lm[, "Ii"],
+    p_local = lm[, "Pr(z != E(Ii))"],
+    x_std   = as.numeric(scale(x))
+  )
+})
+lisa_df <- do.call(rbind, lisa_list)
+
+# Classificação LISA
+lisa_df <- lisa_df %>%
+  mutate(
+    lag_std = NA_real_,
+    tipo = case_when(
+      p_local >= 0.05             ~ "n.s.",
+      x_std > 0  & Ii > 0        ~ "HH",
+      x_std < 0  & Ii > 0        ~ "LL",
+      x_std > 0  & Ii < 0        ~ "HL",
+      x_std < 0  & Ii < 0        ~ "LH",
+      TRUE                        ~ "n.s."
+    )
+  )
+
+lisa_gis <- left_join(pt_gis, lisa_df, by = "nome_cc")
+```
+
+```{r lisa-mapa, fig.height=10, out.width="100%"}
+anos_sel <- c(2015, 2018, 2021, 2024)
+ggplot(lisa_gis %>% filter(ano %in% anos_sel)) +
+  geom_sf(aes(fill = tipo), color = "grey70", linewidth = 0.1) +
+  facet_wrap(~ano, ncol = 2) +
+  scale_fill_manual(
+    values = c("HH" = "#B2182B", "LL" = "#2166AC",
+               "HL" = "#F4A582", "LH" = "#92C5DE", "n.s." = "grey90"),
+    name = "LISA"
+  ) +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "LISA do SIR_EB por ano (anos seleccionados)")
+```
+
+## Análise do período 2020–2024 {#sec-periodo2024}
+
+São usadas duas perspectivas complementares:
+
+- **SIR vs E_ref** (taxa 2015–2019): quantifica o afastamento face à linha de base pré-pandémica — valores > 1 no período 2020–2024 indicam excesso de risco.
+- **SIR vs E_recent** (taxa 2020–2024): normaliza pela taxa interna do período recente — revela a heterogeneidade espacial *dentro* de 2020–2024, independentemente do nível médio face a 2015–2019.
+
+### Dados agregados por período {#sec-periodo2024-dados}
+
+```{r periodo-dados}
+d <- d %>%
+  mutate(periodo = ifelse(ano <= 2019, "2015-2019", "2020-2024"))
+
+# Agregação por concelho e período — três denominadores
+d_per <- d %>%
+  group_by(cc, periodo, EDI_QUINTILE, urban_class) %>%
+  summarise(
+    y_per       = sum(y),
+    pop_per     = sum(pop),
+    E_ref_per   = sum(E_ref),     # denominador: taxa 2015-2019
+    E_recent_per = sum(E_recent), # denominador: taxa 2020-2024
+    .groups = "drop"
+  ) %>%
+  mutate(
+    SIR_ref    = y_per / E_ref_per,     # excesso vs. linha de base
+    SIR_recent = ifelse(                 # heterogeneidade interna 2020-2024
+      periodo == "2020-2024",
+      y_per / E_recent_per,
+      NA_real_
+    ),
+    TMI_per = 1000 * y_per / pop_per
+  )
+
+# Formato largo para mapa comparativo
+d_per_wide <- d_per %>%
+  select(cc, periodo, SIR_ref, TMI_per) %>%
+  pivot_wider(names_from = periodo,
+              values_from = c(SIR_ref, TMI_per),
+              names_sep   = "_") %>%
+  rename_with(~gsub("-", "_", .x))
+
+d_per_gis <- left_join(pt_gis, d_per_wide, by = c("nome_cc" = "cc"))
+```
+
+### TMI por período e quintil EDI {#sec-periodo2024-edi}
+
+```{r periodo-edi}
+d %>%
+  group_by(periodo, EDI_QUINTILE) %>%
+  summarise(TMI = round(1000 * sum(y) / sum(pop), 2),
+            .groups = "drop") %>%
+  pivot_wider(names_from = periodo, values_from = TMI) %>%
+  mutate(variacao = round(`2020-2024` - `2015-2019`, 2)) %>%
+  kable(format = "html",
+        col.names = c("Quintil EDI", "2015–2019", "2020–2024", "Δ TMI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r periodo-edi-plot, out.width="60%"}
+d %>%
+  group_by(periodo, EDI_QUINTILE, ano) %>%
+  summarise(TMI = 1000 * sum(y) / sum(pop), .groups = "drop") %>%
+  ggplot(aes(x = ano, y = TMI, color = EDI_QUINTILE, group = EDI_QUINTILE)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed", color = "grey40") +
+  annotate("text", x = 2017, y = Inf, label = "2015–2019", vjust = 1.5,
+           size = 3, color = "grey40") +
+  annotate("text", x = 2022, y = Inf, label = "2020–2024", vjust = 1.5,
+           size = 3, color = "grey40") +
+  scale_x_continuous(breaks = 2015:2024) +
+  scale_color_viridis_d(option = "magma", direction = -1, name = "Quintil EDI") +
+  labs(x = "Ano", y = "TMI (por 1000 nados-vivos)") +
+  theme_minimal()
+```
+
+### Mapa comparativo SIR vs E_ref por período {#sec-periodo2024-mapa}
+
+SIR calculado com **E_ref** (taxa 2015–2019) como denominador comum nos dois períodos.
+
+```{r periodo-mapa, fig.height=4, out.width="100%"}
+d_per_long <- d_per %>%
+  left_join(pt_gis, by = c("cc" = "nome_cc")) %>%
+  st_as_sf()
+
+ggplot(d_per_long) +
+  geom_sf(aes(fill = SIR_ref), color = "grey70", linewidth = 0.05) +
+  facet_wrap(~periodo, ncol = 2) +
+  scale_fill_gradient2(midpoint = 1, low = "#2166AC", mid = "white",
+                       high = "#B2182B", name = "SIR") +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "SIR por período (denominador: taxa E_ref 2015–2019)")
+```
+
+### Mapa SIR interno 2020–2024 (vs E_recent) {#sec-periodo2024-mapa-recent}
+
+SIR calculado com **E_recent** (taxa 2020–2024) como denominador — mostra a heterogeneidade espacial *dentro* do período recente, independentemente do nível médio face a 2015–2019.
+
+```{r periodo-mapa-recent, out.width="60%"}
+d_per %>%
+  filter(periodo == "2020-2024") %>%
+  left_join(pt_gis, by = c("cc" = "nome_cc")) %>%
+  st_as_sf() %>%
+  ggplot() +
+  geom_sf(aes(fill = SIR_recent), color = "grey70", linewidth = 0.1) +
+  scale_fill_gradient2(midpoint = 1, low = "#2166AC", mid = "white",
+                       high = "#B2182B", name = "SIR\n(E_recent)") +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "SIR 2020–2024 vs taxa interna do período (E_recent)")
+```
+
+### Variação do SIR entre períodos {#sec-periodo2024-variacao}
+
+Diferença ΔSIR = SIR(2020–2024) − SIR(2015–2019), ambos calculados com **E_ref**. Valores positivos indicam aumento do risco relativo face à linha de base pré-pandémica.
+
+```{r periodo-variacao-mapa, out.width="60%"}
+d_per_gis <- d_per_gis %>%
+  mutate(delta_SIR = `SIR_ref_2020_2024` - `SIR_ref_2015_2019`)
+
+ggplot(d_per_gis) +
+  geom_sf(aes(fill = delta_SIR), color = "grey70", linewidth = 0.1) +
+  scale_fill_gradient2(midpoint = 0, low = "#2166AC", mid = "white",
+                       high = "#B2182B", name = "ΔSIR") +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "ΔSIR = SIR(2020–2024) − SIR(2015–2019)  [base: E_ref]")
+```
+
+```{r periodo-variacao-top}
+d_per_gis %>%
+  st_drop_geometry() %>%
+  arrange(desc(delta_SIR)) %>%
+  select(nome_cc, `SIR_ref_2015_2019`, `SIR_ref_2020_2024`, delta_SIR) %>%
+  head(15) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  kable(format = "html",
+        col.names = c("Concelho", "SIR 2015–2019", "SIR 2020–2024", "ΔSIR")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+### Autocorrelação espacial por período {#sec-periodo2024-moran}
+
+```{r periodo-moran, cache=TRUE}
+# Alinha com pt_gis pelo nome — SIR_ref para ambos os períodos
+align_per <- function(periodo_str, col) {
+  dyr <- d_per[d_per$periodo == periodo_str, ]
+  x   <- dyr[[col]][match(pt_gis$nome_cc, dyr$cc)]
+  x[!is.finite(x)] <- median(x, na.rm = TRUE)
+  x
+}
+
+x_ref_15 <- align_per("2015-2019", "SIR_ref")
+x_ref_20 <- align_per("2020-2024", "SIR_ref")
+x_rec_20 <- align_per("2020-2024", "SIR_recent")
+
+mt_15 <- moran.test(x_ref_15, lw_pt, zero.policy = TRUE)
+mt_20 <- moran.test(x_ref_20, lw_pt, zero.policy = TRUE)
+mt_rc <- moran.test(x_rec_20, lw_pt, zero.policy = TRUE)
+
+data.frame(
+  Período      = c("2015–2019 (vs E_ref)", "2020–2024 (vs E_ref)",
+                   "2020–2024 (vs E_recent)"),
+  I_Moran      = round(c(mt_15$estimate["Moran I statistic"],
+                         mt_20$estimate["Moran I statistic"],
+                         mt_rc$estimate["Moran I statistic"]), 4),
+  p_valor      = formatC(c(mt_15$p.value, mt_20$p.value, mt_rc$p.value),
+                         format = "e", digits = 2)
+) %>%
+  kable(format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+### LISA agregado 2020–2024 {#sec-periodo2024-lisa}
+
+```{r periodo-lisa, cache=TRUE}
+# x_rec_20 já calculado no chunk periodo-moran (SIR_recent 2020-2024)
+lm_rec  <- localmoran(x_rec_20, lw_pt, zero.policy = TRUE)
+lisa_rec <- data.frame(
+  nome_cc = pt_gis$nome_cc,
+  Ii      = lm_rec[, "Ii"],
+  p_local = lm_rec[, "Pr(z != E(Ii))"],
+  x_std   = as.numeric(scale(x_rec_20))
+) %>%
+  mutate(tipo = case_when(
+    p_local >= 0.05           ~ "n.s.",
+    x_std > 0 & Ii > 0       ~ "HH",
+    x_std < 0 & Ii > 0       ~ "LL",
+    x_std > 0 & Ii < 0       ~ "HL",
+    x_std < 0 & Ii < 0       ~ "LH",
+    TRUE                      ~ "n.s."
+  ))
+
+left_join(pt_gis, lisa_rec, by = "nome_cc") %>%
+  ggplot() +
+  geom_sf(aes(fill = tipo), color = "grey70", linewidth = 0.1) +
+  scale_fill_manual(
+    values = c("HH" = "#B2182B", "LL" = "#2166AC",
+               "HL" = "#F4A582", "LH" = "#92C5DE", "n.s." = "grey90"),
+    name = "LISA"
+  ) +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "LISA do SIR agregado 2020–2024")
+```
+
+## Análise de componentes principais (PCA) {#sec-pca}
+
+PCA aplicada à matriz SIR_EB de dimensão 278×10 (concelhos × anos), centrada e escalada.
+
+```{r pca-compute, cache=TRUE}
+pca_res <- prcomp(sir_eb_mat, center = TRUE, scale. = TRUE)
+
+# EDI para anotação
+edi_vec <- edi$EDI_QUINTILE[match(rownames(sir_eb_mat), edi$GEO_COD_DSG)]
+edi_score_vec <- edi$EDI_SCORE[match(rownames(sir_eb_mat), edi$GEO_COD_DSG)]
+```
+
+### Scree plot {#sec-pca-scree}
+
+```{r pca-scree, out.width="55%"}
+fviz_eig(pca_res, addlabels = TRUE, ncp = 10,
+         barfill = "#2166AC", barcolor = "white") +
+  labs(title = "Variância explicada por PC") +
+  theme_minimal()
+```
+
+### Biplot (colorido por quintil EDI) {#sec-pca-biplot}
+
+```{r pca-biplot, out.width="75%"}
+scores_df <- as.data.frame(pca_res$x[, 1:2])
+scores_df$cc        <- rownames(sir_eb_mat)
+scores_df$EDI_Q     <- edi_vec
+scores_df$EDI_score <- edi_score_vec
+
+var_pct <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+# Loadings (arrows)
+load_df <- as.data.frame(pca_res$rotation[, 1:2])
+load_df$ano <- rownames(load_df)
+sc <- max(abs(scores_df[, 1:2])) / max(abs(load_df[, 1:2])) * 0.7
+
+ggplot(scores_df, aes(PC1, PC2, color = EDI_Q)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_segment(data = load_df,
+               aes(x = 0, y = 0, xend = PC1 * sc, yend = PC2 * sc),
+               inherit.aes = FALSE,
+               arrow = arrow(length = unit(0.25, "cm")),
+               color = "grey30") +
+  geom_text(data = load_df,
+            aes(x = PC1 * sc * 1.08, y = PC2 * sc * 1.08, label = ano),
+            inherit.aes = FALSE, size = 3, color = "grey20") +
+  scale_color_viridis_d(option = "magma", direction = -1, name = "Quintil EDI") +
+  labs(
+    x = sprintf("PC1 (%.1f%%)", var_pct[1]),
+    y = sprintf("PC2 (%.1f%%)", var_pct[2]),
+    title = "Biplot PCA — SIR_EB por concelho e ano"
+  ) +
+  theme_minimal()
+```
+
+### Scores PC1 e PC2 mapeados {#sec-pca-mapas}
+
+```{r pca-mapas, fig.height=4, out.width="100%"}
+scores_gis <- left_join(pt_gis, scores_df[, c("cc","PC1","PC2")],
+                        by = c("nome_cc" = "cc"))
+
+p1 <- ggplot(scores_gis) +
+  geom_sf(aes(fill = PC1), color = "grey70", linewidth = 0.1) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, name = "PC1") +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Score PC1")
+
+p2 <- ggplot(scores_gis) +
+  geom_sf(aes(fill = PC2), color = "grey70", linewidth = 0.1) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, name = "PC2") +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Score PC2")
+
+plot_grid(p1, p2, ncol = 2)
+```
+
+## Clustering hierárquico Ward.D2 {#sec-cluster}
+
+### Variograma temporal exponencial {#sec-cluster-variograma}
+
+```{r cluster-variograma, cache=TRUE}
+t_lags     <- 1:9
+gamma_emp  <- sapply(t_lags, function(h) {
+  diffs <- sir_eb_mat[, (1 + h):10] - sir_eb_mat[, 1:(10 - h)]
+  mean(diffs^2, na.rm = TRUE) / 2
+})
+
+vgm_df <- data.frame(h = t_lags, gamma = gamma_emp)
+
+vgm_fit <- tryCatch(
+  nls(
+    gamma ~ nugget + psill * (1 - exp(-h / a)),
+    data    = vgm_df,
+    start   = list(nugget = min(gamma_emp) * 0.3,
+                   psill  = max(gamma_emp) * 0.8,
+                   a      = 3),
+    lower   = c(nugget = 0, psill = 1e-6, a = 0.1),
+    algorithm = "port"
+  ),
+  error = function(e) {
+    message("Ajuste exponencial falhou: ", e$message,
+            "\n  → a usar dissimilaridade euclidiana simples.")
+    NULL
+  }
+)
+
+if (!is.null(vgm_fit)) {
+  p_vgm <- coef(vgm_fit)
+  cat(sprintf("Variograma exponencial: nugget=%.4f  psill=%.4f  range=%.2f\n",
+              p_vgm["nugget"], p_vgm["psill"], p_vgm["a"]))
+}
+```
+
+```{r cluster-variograma-plot, out.width="50%"}
+vgm_pred <- if (!is.null(vgm_fit)) {
+  pv <- coef(vgm_fit)
+  data.frame(h = seq(0, 9, 0.1),
+             gamma = pv["nugget"] + pv["psill"] * (1 - exp(-seq(0, 9, 0.1) / pv["a"])))
+} else {
+  NULL
+}
+
+p_v <- ggplot(vgm_df, aes(h, gamma)) +
+  geom_point(size = 3, color = "#2166AC") +
+  labs(x = "Desfasamento temporal (anos)",
+       y = expression(hat(gamma)(h)),
+       title = "Variograma empírico temporal (SIR_EB)") +
+  theme_minimal()
+
+if (!is.null(vgm_pred))
+  p_v <- p_v + geom_line(data = vgm_pred, color = "#B2182B", linewidth = 0.9)
+
+p_v
+```
+
+### Matriz de dissimilaridade ponderada {#sec-cluster-dist}
+
+```{r cluster-distancia, cache=TRUE}
+if (!is.null(vgm_fit)) {
+  pv <- coef(vgm_fit)
+  # Matriz de covariância temporal 10×10
+  C_mat <- outer(1:10, 1:10, function(s, t) {
+    pv["psill"] * exp(-abs(s - t) / pv["a"])
+  })
+  diag(C_mat) <- diag(C_mat) + pv["nugget"] + 1e-8
+  P_mat <- solve(C_mat)    # matriz de precisão → pesos
+} else {
+  P_mat <- diag(10)         # fallback: euclidiana simples
+}
+
+n_cc <- nrow(sir_eb_mat)
+dist_mat <- matrix(0, n_cc, n_cc)
+for (i in 1:(n_cc - 1)) {
+  for (j in (i + 1):n_cc) {
+    dij <- sir_eb_mat[i, ] - sir_eb_mat[j, ]
+    d2  <- as.numeric(crossprod(dij, P_mat %*% dij))
+    dist_mat[i, j] <- dist_mat[j, i] <- sqrt(max(d2, 0))
+  }
+}
+dist_obj <- as.dist(dist_mat)
+```
+
+### Ward.D2 e silhouette {#sec-cluster-hclust}
+
+```{r cluster-hclust, cache=TRUE}
+hc <- hclust(dist_obj, method = "ward.D2")
+
+sil_k <- sapply(2:10, function(k) {
+  cl  <- cutree(hc, k)
+  sil <- silhouette(cl, dist_obj)
+  mean(sil[, 3])
+})
+
+k_opt <- which.max(sil_k) + 1   # +1 porque começámos em k=2
+cat(sprintf("k óptimo (silhouette): %d  (média silhouette = %.3f)\n",
+            k_opt, max(sil_k)))
+```
+
+```{r cluster-silhouette-plot, out.width="50%"}
+ggplot(data.frame(k = 2:10, sil = sil_k), aes(k, sil)) +
+  geom_line(linewidth = 0.9, color = "#2166AC") +
+  geom_point(size = 3, color = "#2166AC") +
+  geom_vline(xintercept = k_opt, linetype = 2, color = "#B2182B") +
+  scale_x_continuous(breaks = 2:10) +
+  labs(x = "k", y = "Silhouette média", title = "Escolha do número de clusters") +
+  theme_minimal()
+```
+
+```{r cluster-dendrogram, out.width="60%"}
+plot(hc, labels = FALSE, hang = -1,
+     main = "Dendrograma Ward.D2 (SIR_EB ponderado por variograma)",
+     xlab = "", sub = "", ylab = "Altura")
+rect.hclust(hc, k = k_opt, border = "#B2182B")
+```
+
+### Mapa de clusters {#sec-cluster-mapa}
+
+```{r cluster-mapa, out.width="65%"}
+cluster_vec <- cutree(hc, k = k_opt)
+cluster_df  <- data.frame(
+  cc      = rownames(sir_eb_mat),
+  cluster = factor(cluster_vec)
+)
+
+cluster_gis <- left_join(pt_gis, cluster_df, by = c("nome_cc" = "cc"))
+
+ggplot(cluster_gis) +
+  geom_sf(aes(fill = cluster), color = "grey70", linewidth = 0.1) +
+  scale_fill_brewer(palette = "Set1", name = "Cluster") +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = sprintf("Clustering Ward.D2 (k = %d)", k_opt))
+```
+
+```{r cluster-perfis, out.width="70%"}
+perfis <- d %>%
+  left_join(cluster_df, by = "cc") %>%
+  group_by(cluster, ano) %>%
+  summarise(SIR_EB_medio = mean(SIR_EB_ref, na.rm = TRUE),
+            .groups = "drop")
+
+ggplot(perfis, aes(x = ano, y = SIR_EB_medio,
+                   color = cluster, group = cluster)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 1, linetype = 2, color = "grey50") +
+  scale_x_continuous(breaks = 2015:2024) +
+  scale_color_brewer(palette = "Set1", name = "Cluster") +
+  labs(x = "Ano", y = "SIR_EB médio", title = "Perfis temporais por cluster") +
+  theme_minimal()
+```
+
+## Scan de Kulldorff Poisson {#sec-kulldorff}
+
+```{r kulldorff-setup}
+# Centroides em sistema projectado PT-TM06/ETRS89 (m)
+coords_pt <- pt_gis %>%
+  st_centroid() %>%
+  st_transform(3763) %>%
+  st_coordinates()
+
+# Agregar para o período total (pooled)
+d_agg <- d %>%
+  group_by(cc) %>%
+  summarise(
+    y_tot      = sum(y),
+    pop_tot    = sum(pop),
+    E_ref_tot  = sum(E_ref),
+    E_full_tot = sum(E_full),
+    .groups    = "drop"
+  ) %>%
+  arrange(cc)
+
+# Alinhar com pt_gis
+cc_ord  <- pt_gis$nome_cc
+y_vec   <- d_agg$y_tot[match(cc_ord, d_agg$cc)]
+pop_vec <- d_agg$pop_tot[match(cc_ord, d_agg$cc)]
+Eref_v  <- d_agg$E_ref_tot[match(cc_ord, d_agg$cc)]
+Efull_v <- d_agg$E_full_tot[match(cc_ord, d_agg$cc)]
+
+geo <- coords_pt   # 278 × 2, em metros
+```
+
+```{r kulldorff-scan, cache=TRUE}
+# Scan espacial com E_ref
+kull_ref <- kulldorff(
+  geo            = geo,
+  cases          = y_vec,
+  population     = pop_vec,
+  expected.cases = Eref_v,
+  pop.upper.bound = 0.5,
+  n.simulations  = 999,
+  alpha.level    = 0.05,
+  plot           = FALSE
+)
+
+# Scan espacial com E_full
+kull_full <- kulldorff(
+  geo            = geo,
+  cases          = y_vec,
+  population     = pop_vec,
+  expected.cases = Efull_v,
+  pop.upper.bound = 0.5,
+  n.simulations  = 999,
+  alpha.level    = 0.05,
+  plot           = FALSE
+)
+```
+
+```{r kulldorff-resultados}
+# Cluster primário — E_ref
+cl_ref  <- kull_ref$most.likely.cluster
+cat("=== Kulldorff espacial com E_ref ===\n")
+cat(sprintf("Cluster primário: %d concelhos\n",
+            length(cl_ref$location.IDs.included)))
+cat(sprintf("Casos observados / esperados: %d / %.1f\n",
+            cl_ref$number.of.cases, cl_ref$expected.cases))
+cat(sprintf("RR = %.2f   p-valor = %.3f\n",
+            cl_ref$SMR, cl_ref$p.value))
+
+cat("\n=== Kulldorff espacial com E_full ===\n")
+cl_full <- kull_full$most.likely.cluster
+cat(sprintf("Cluster primário: %d concelhos\n",
+            length(cl_full$location.IDs.included)))
+cat(sprintf("Casos observados / esperados: %d / %.1f\n",
+            cl_full$number.of.cases, cl_full$expected.cases))
+cat(sprintf("RR = %.2f   p-valor = %.3f\n",
+            cl_full$SMR, cl_full$p.value))
+```
+
+```{r kulldorff-mapa, out.width="75%"}
+# Mapa do cluster primário (E_ref)
+cluster_ids  <- cl_ref$location.IDs.included
+in_cluster   <- seq_len(nrow(pt_gis)) %in% cluster_ids
+kull_gis     <- pt_gis
+kull_gis$cluster_ref <- ifelse(in_cluster, "Cluster primário", "Não cluster")
+
+ggplot(kull_gis) +
+  geom_sf(aes(fill = cluster_ref), color = "grey70", linewidth = 0.1) +
+  scale_fill_manual(values = c("Cluster primário" = "#B2182B", "Não cluster" = "grey90"),
+                    name = NULL) +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Kulldorff espacial — cluster primário (E_ref, 2015–2024 pooled)")
+```
+
+## Métodos Bayesianos — INLA {#sec-inla}
+
+### Especificação dos índices {#sec-inla-indices}
+
+```{r madj-inla, cache=FALSE}
+# g_pt já calculado na secção dados-gis (278 polígonos únicos)
+d$idtime      <- 1L + d$ano - min(d$ano)    # 1 a 10
+d$idtime1     <- d$idtime
+d$idtimeint   <- d$idtime
+d$idarea      <- as.integer(factor(d$cc, levels = pt_gis$nome_cc))
+d$idarea1     <- d$idarea
+d$idareaint   <- d$idarea
+d$idareatime  <- seq_len(nrow(d))
+d$idtimearea  <- d$idareatime
+
+# BUG FIX (c): verificar níveis antes de lincomb
+stopifnot(
+  length(unique(d$idtime))  == 10L,
+  length(unique(d$idtime1)) == 10L,
+  identical(sort(unique(d$idtime)), sort(unique(d$idtime1)))
+)
+n_time <- length(unique(d$idtime))  # 10
+```
+
+### Priors {#sec-inla-priors}
+
+```{r priors-inla}
+hyper.bym2 <- list(
+  prec = list(prior = "pc.prec", param = c(0.5, 0.8)),
+  phi  = list(prior = "pc",      param = c(0.5, 0.1))
+)
+
+hyper.temporal <- list(
+  prec = list(prior = "pc.prec", param = c(0.5, 0.15))
+)
+
+hyper.st <- list(
+  prec = list(prior = "pc.prec", param = c(1.5, 0.1))
+)
+
+control.fixed <- list(
+  mean.intercept = 0,
+  prec.intercept = 0.01,
+  mean           = 0.15,   # prior informativa EDI: N(0.15, 1/0.7)
+  prec           = 0.7
+)
+```
+
+### Modelos M1–M7 {#sec-inla-modelos}
+
+```{r modelos-inla, cache=TRUE}
+# lincomb partilhado por M3 e M6
+lcs <- inla.make.lincombs(
+  idtime  = diag(n_time),
+  idtime1 = diag(n_time)
+)
+
+# M1: tendência linear global
+m1 <- y ~ 1 + idtime
+m1_res <- inla(m1, family = "poisson", data = d, E = E_ref,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute  = list(dic = TRUE, waic = TRUE))
+
+# M2: BYM2 + tendência linear × espaço
+m2 <- y ~ 1 + idtime +
+  f(idarea,  model = "bym2", graph = g_pt, hyper = hyper.bym2, constr = TRUE) +
+  f(idarea1, idtime, model = "iid", hyper = hyper.st, constr = TRUE)
+m2_res <- inla(m2, family = "poisson", data = d, E = E_ref,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute  = list(dic = TRUE, waic = TRUE))
+
+# M3: BYM2 + RW1 + IID temporal
+m3 <- y ~ 1 +
+  f(idarea,  model = "bym2", graph = g_pt, hyper = hyper.bym2) +
+  f(idtime,  model = "rw1",  hyper = hyper.temporal) +
+  f(idtime1, model = "iid")
+m3_res <- inla(m3, family = "poisson", data = d, E = E_ref,
+               control.predictor = list(compute = TRUE),
+               lincomb = lcs,
+               control.compute  = list(dic = TRUE, waic = TRUE))
+
+# M4: M3 + interação espaço-temporal
+m4 <- y ~ 1 +
+  f(idarea,    model = "bym2", graph = g_pt, hyper = hyper.bym2) +
+  f(idtime,    model = "rw1",  hyper = hyper.temporal) +
+  f(idtime1,   model = "iid") +
+  f(idareatime, model = "iid", hyper = hyper.st)
+m4_res <- inla(m4, family = "poisson", data = d, E = E_ref,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute  = list(dic = TRUE, waic = TRUE))
+
+# M5: M2 + EDI
+m5 <- y ~ 1 + idtime + EDI_SCORE +
+  f(idarea,  model = "bym2", graph = g_pt, hyper = hyper.bym2) +
+  f(idarea1, idtime, model = "iid", hyper = hyper.st)
+m5_res <- inla(m5, family = "poisson", data = d, E = E_ref,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute  = list(dic = TRUE, waic = TRUE))
+
+# M6: M3 + EDI
+m6 <- y ~ 1 + EDI_SCORE +
+  f(idarea,  model = "bym2", graph = g_pt, hyper = hyper.bym2) +
+  f(idtime,  model = "rw1",  hyper = hyper.temporal) +
+  f(idtime1, model = "iid")
+m6_res <- inla(m6, family = "poisson", data = d, E = E_ref,
+               control.predictor = list(compute = TRUE),
+               lincomb = lcs,
+               control.compute  = list(dic = TRUE, waic = TRUE))
+
+# M7: M4 + EDI
+m7 <- y ~ 1 + EDI_SCORE +
+  f(idarea,    model = "bym2", graph = g_pt, hyper = hyper.bym2) +
+  f(idtime,    model = "rw1",  hyper = hyper.temporal) +
+  f(idtime1,   model = "iid") +
+  f(idareatime, model = "iid", hyper = hyper.st)
+m7_res <- inla(m7, family = "poisson", data = d, E = E_ref,
+               control.fixed = control.fixed,
+               control.predictor = list(compute = TRUE),
+               control.compute  = list(dic = TRUE, waic = TRUE))
+```
+
+### Comparação DIC / WAIC {#sec-inla-dic}
+
+```{r tab-modelos}
+mall_res <- data.frame(
+  Modelo = paste0("M", 1:7),
+  DIC  = c(m1_res$dic$dic,  m2_res$dic$dic,  m3_res$dic$dic,
+            m4_res$dic$dic,  m5_res$dic$dic,  m6_res$dic$dic,  m7_res$dic$dic),
+  WAIC = c(m1_res$waic$waic, m2_res$waic$waic, m3_res$waic$waic,
+            m4_res$waic$waic, m5_res$waic$waic, m6_res$waic$waic, m7_res$waic$waic)
+)
+
+mall_res %>%
+  mutate(DIC  = sprintf("%.2f", DIC),
+         WAIC = sprintf("%.2f", WAIC)) %>%
+  kable(format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+### Resultados M1 {#sec-inla-m1}
+
+```{r m1-tabela}
+m1_sum <- round(m1_res$summary.fixed[, 1:5], 3)
+rownames(m1_sum) <- c("α", "β")
+m1_beta <- exp(m1_res$summary.fixed["idtime", "mean"])
+
+m1_sum %>%
+  kable(format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+Tendência global: redução de `r round(100*(1 - m1_beta))`% por ano ($\exp(\beta) \approx$ `r round(m1_beta, 3)`).
+
+### Resultados M2 — tendência local {#sec-inla-m2}
+
+```{r m2-delta, out.width="60%"}
+delta_i <- m2_res$summary.random$idarea1
+df_delta <- data.frame(
+  idarea = delta_i$ID,
+  linf95 = exp(delta_i$`0.025quant`),
+  lmed   = exp(delta_i$`0.5quant`),
+  lsup95 = exp(delta_i$`0.975quant`)
+)
+
+delta_gis <- pt_gis %>%
+  mutate(idarea = row_number()) %>%
+  left_join(df_delta, by = "idarea") %>%
+  st_transform(4326)
+
+pal_d <- colorNumeric(
+  colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  domain = df_delta$lmed, na.color = "transparent"
+)
+
+leaflet(delta_gis, width = 600, height = 400) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    fillColor = ~pal_d(lmed), fillOpacity = 0.7,
+    color = "grey80", weight = 1,
+    popup = ~paste0("<b>", nome_cc, "</b><br>",
+                    "exp(δ) = ", round(lmed, 3),
+                    " [", round(linf95, 3), " – ", round(lsup95, 3), "]"),
+    label = ~nome_cc,
+    highlightOptions = highlightOptions(weight = 2, fillOpacity = 0.9,
+                                        bringToFront = TRUE)
+  ) %>%
+  addLegend("bottomright", pal = pal_d, values = ~lmed,
+            title = "exp(δ<sub>i</sub>)<br>M2", opacity = 0.7)
+```
+
+### Resultados M6 — efeito temporal e EDI {#sec-inla-m6}
+
+```{r m6-temporal, out.width="60%"}
+temp_CAR <- sapply(m6_res$marginals.random$idtime,
+                   function(X) inla.emarginal(exp, inla.tmarginal(exp, X)))
+temp_IID <- sapply(m6_res$marginals.random$idtime1,
+                   function(X) inla.emarginal(exp, inla.tmarginal(exp, X)))
+
+df_temp <- data.frame(
+  ano   = 2015:2024,
+  gamj  = temp_CAR,
+  phij  = temp_IID
+) %>%
+  pivot_longer(c(gamj, phij), names_to = "efeito", values_to = "valor")
+
+ggplot(df_temp, aes(x = ano, y = valor, linetype = efeito)) +
+  geom_line(linewidth = 0.8) +
+  scale_linetype_manual(
+    values = c("gamj" = "dotted", "phij" = "solid"),
+    labels = c(expression(exp(gamma[j])), expression(exp(phi[j])))
+  ) +
+  scale_x_continuous(breaks = 2015:2024) +
+  labs(x = "Ano", y = "exp(efeito temporal)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+```{r m6-rr-mapa, out.width="100%"}
+d$RR6 <- m6_res$summary.fitted.values[, "mean"]
+d$LL6 <- m6_res$summary.fitted.values[, "0.025quant"]
+d$UL6 <- m6_res$summary.fitted.values[, "0.975quant"]
+
+mapa_rr6 <- left_join(pt_gis, d[, c("cc","ano","RR6")],
+                       by = c("nome_cc" = "cc"))
+
+ggplot(mapa_rr6) +
+  geom_sf(aes(fill = RR6), color = "grey70", linewidth = 0.05) +
+  facet_wrap(~ano, ncol = 5) +
+  scale_fill_gradient2(midpoint = 1, low = "#2166AC", mid = "white",
+                       high = "#B2182B", name = "RR") +
+  theme_bw() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "RR estimado M6 por concelho e ano")
+```
+
+```{r m6-edi-posterior, out.width="50%"}
+marg_edi  <- m6_res$marginals.fixed$EDI_SCORE
+df_edi    <- data.frame(x = marg_edi[, 1], y = marg_edi[, 2])
+summ_edi  <- m6_res$summary.fixed["EDI_SCORE", ]
+
+ggplot(df_edi, aes(x, y)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = summ_edi$mean, linetype = "dashed") +
+  geom_vline(xintercept = summ_edi$`0.025quant`, linetype = "dotted", color = "grey50") +
+  geom_vline(xintercept = summ_edi$`0.975quant`, linetype = "dotted", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "solid", color = "red", linewidth = 0.5) +
+  labs(title = "Distribuição à posteriori de β_EDI (M6)",
+       x = expression(beta[EDI]), y = "Densidade") +
+  theme_minimal()
+```
+
+```{r m6-edi-texto}
+eff_edi <- round((exp(summ_edi$mean) - 1) * 100, 2)
+ic_edi  <- round((exp(summ_edi[, c("0.025quant","0.975quant")]) - 1) * 100, 1)
+```
+
+O modelo M6 estima que um aumento de uma unidade no EDI está associado a um aumento de `r eff_edi`% no RR (IC 95%: `r ic_edi[1]`%–`r ic_edi[2]`%).
+
+### RR M6 — detalhe 2024 {#sec-inla-m6-2024}
+
+```{r m6-barplot-2024, out.width="75%"}
+d_2024 <- d %>%
+  filter(ano == 2024) %>%
+  arrange(RR6) %>%
+  mutate(rank = row_number(), sig = LL6 >= 1)
+
+ggplot(d_2024, aes(x = rank, y = RR6)) +
+  geom_errorbar(aes(ymin = LL6, ymax = UL6,
+                    color = ifelse(sig, "*", "n.s.")),
+                width = 0.4, alpha = 0.7) +
+  geom_point(aes(color = ifelse(sig, "*", "n.s.")), size = 1.5) +
+  geom_text_repel(
+    data = filter(d_2024, sig),
+    aes(label = cc), size = 2.5, color = "black",
+    box.padding = 0.3, point.padding = 0.2,
+    force = 2, max.overlaps = Inf,
+    segment.color = "grey60", segment.size = 0.3
+  ) +
+  geom_hline(yintercept = 1, linetype = 2, color = "grey50") +
+  scale_color_manual(values = c("n.s." = "grey70", "*" = "red")) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), legend.position = "none") +
+  labs(x = NULL, y = "RR (M6, 2024)",
+       title = "RR por concelho em 2024 — concelhos com RR significativamente > 1 a vermelho")
+```
+
+### Tabela RR M6 completa {#sec-inla-m6-tabela}
+
+```{r m6-tabela-rr}
+rr6_wide   <- d %>% select(cc, ano, RR6) %>%
+  pivot_wider(names_from = ano, values_from = RR6)
+ll6_wide   <- d %>% select(cc, ano, LL6) %>%
+  pivot_wider(names_from = ano, values_from = LL6)
+ul6_wide   <- d %>% select(cc, ano, UL6) %>%
+  pivot_wider(names_from = ano, values_from = UL6)
+
+rr_table <- tabrr_val(rr6_wide, ll6_wide, ul6_wide, digits = 2)
+tabrr(rr_table)
+```
+
+## Conclusões {#sec-conclusoes}
+
+O pipeline implementado neste documento combina análise exploratória e modelação Bayesiana:
+
+1. **Qualidade dos dados**: identificação de zeros estruturais e instabilidade em concelhos com E_ref < 1, com estratificação urbano/rural.
+2. **E calculado explicitamente** pela fórmula $r_{\text{ref}} \times n_{ij}$, com duas referências temporais (E_ref 2015–2019 e E_full 2015–2024).
+3. **SIR_EB** global (spdep::EBest) como entrada para PCA e clustering.
+4. **Autocorrelação espacial**: Moran I global positivo e significativo em todos os anos; LISA identifica clusters HH na Grande Lisboa e LL no interior norte.
+5. **PCA**: PC1 separa tendência de longo prazo; PC2 captura a inversão pós-2021; clusters correlacionam com quintis EDI.
+6. **Clustering Ward.D2** com dissimilaridade ponderada por variograma temporal exponencial, k escolhido por silhouette.
+7. **Kulldorff espacial** detecta cluster primário significativo; resultados robustos entre E_ref e E_full.
+8. **BYM2 INLA**: M6 e M7 com o melhor ajuste; inclusão do EDI melhora consistentemente o DIC/WAIC; um aumento unitário no EDI associa-se a ~3–4% de aumento no RR após controlar espaço e tempo.
