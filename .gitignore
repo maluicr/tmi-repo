@@ -20,3 +20,7 @@ rr_2015-2024_v2_cache/html/__packages
 rr_2015-2024_v3_cache/html/__packages
 *.woff
 *.woff
+*.rds
+map.adj
+*.html
+tmi-repo.Rproj
